@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Cookie, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -12,8 +12,8 @@ from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Set
 import uuid
 from datetime import datetime, timezone, timedelta
-from fastapi.responses import JSONResponse
 import secrets
+from urllib.parse import urlencode
 from google.oauth2 import id_token
 from google.auth.transport import requests as g_requests
 ROOT_DIR = Path(__file__).parent
@@ -21,6 +21,9 @@ load_dotenv(ROOT_DIR / '.env')
 
 mongo_url = os.environ['MONGO_URI']
 GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
+GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
+FRONTEND_URL = os.environ["FRONTEND_URL"].rstrip("/")
+BACKEND_PUBLIC_URL = os.environ["BACKEND_PUBLIC_URL"].rstrip("/")
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
@@ -155,32 +158,186 @@ async def get_current_user(request: Request) -> User:
         user_doc["created_at"] = datetime.fromisoformat(user_doc["created_at"])
     return User(**user_doc)
 
+
+async def _create_session_and_set_cookie(response: Response, user_id: str, remember_me: bool) -> str:
+    """Erstellt eine DB-Session + setzt den session_token Cookie. Gibt den Token zurück."""
+    session_token = secrets.token_urlsafe(48)
+    if remember_me:
+        session_days = 30
+        cookie_max_age = 30 * 24 * 3600
+    else:
+        session_days = 1
+        cookie_max_age = None  # Session-Cookie
+    expires_at = datetime.now(timezone.utc) + timedelta(days=session_days)
+    await db.user_sessions.insert_one({
+        "user_id": user_id,
+        "session_token": session_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+        max_age=cookie_max_age,
+    )
+    return session_token
+
+
+async def _upsert_google_user(email: str, name: str, picture: Optional[str]) -> tuple[str, bool]:
+    """Legt User an oder updated. Gibt (user_id, remember_me) zurück."""
+    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    if existing:
+        user_id = existing["user_id"]
+        remember_me = existing.get("remember_me", True)
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"name": name, "picture": picture}}
+        )
+        return user_id, remember_me
+
+    user_id = f"user_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc)
+    await db.users.insert_one({
+        "user_id": user_id,
+        "email": email,
+        "name": name,
+        "picture": picture,
+        "created_at": now.isoformat(),
+        "remember_me": True,
+    })
+    await db.user_goals.insert_one({
+        "user_id": user_id,
+        "exercises": [dict(e) for e in DEFAULT_EXERCISES],
+        "boosts": [],
+        "weekly_increase": BASE_INCREASE,
+        "start_date": now.isoformat(),
+    })
+    return user_id, True
+
+
 # -------------------- Auth routes --------------------
 
-# REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+# --- Google OAuth 2.0 Authorization Code Flow (Server-Side Redirect) ---
+# Frontend Button -> GET /api/auth/google/login -> 302 zu Google -> User waehlt Konto
+# -> Google 302 zu /api/auth/google/callback?code=... -> Backend tauscht Code,
+# erstellt Session, setzt Cookie, 302 zu FRONTEND_URL/dashboard.
+
+@api_router.get("/auth/google/login")
+async def google_login_start(redirect: str = "/dashboard"):
+    """Startet den OAuth-Flow und redirected den Browser zu Googles Consent-Screen."""
+    state = secrets.token_urlsafe(24)
+    # Nur Pfade auf dem Frontend zulassen (kein open redirect)
+    if not redirect.startswith("/"):
+        redirect = "/dashboard"
+    await db.oauth_states.insert_one({
+        "state": state,
+        "redirect_to": redirect,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    callback_url = f"{BACKEND_PUBLIC_URL}/api/auth/google/callback"
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": callback_url,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "access_type": "online",
+        "prompt": "select_account",
+        "include_granted_scopes": "true",
+    }
+    google_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    return RedirectResponse(google_url, status_code=302)
+
+
+@api_router.get("/auth/google/callback")
+async def google_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+):
+    """OAuth Callback: tauscht Code gegen ID-Token, erstellt Session, redirected zum Frontend."""
+    def _fail(reason: str) -> RedirectResponse:
+        return RedirectResponse(f"{FRONTEND_URL}/?auth_error={reason}", status_code=302)
+
+    if error:
+        return _fail(error)
+    if not code or not state:
+        return _fail("missing_params")
+
+    # Cleanup alter States (>10min) — async, best-effort
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    try:
+        await db.oauth_states.delete_many({"created_at": {"$lt": cutoff}})
+    except Exception:
+        pass
+
+    state_doc = await db.oauth_states.find_one_and_delete({"state": state})
+    if not state_doc:
+        return _fail("invalid_state")
+    redirect_to = state_doc.get("redirect_to", "/dashboard")
+    if not redirect_to.startswith("/"):
+        redirect_to = "/dashboard"
+
+    callback_url = f"{BACKEND_PUBLIC_URL}/api/auth/google/callback"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as hc:
+            token_resp = await hc.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": callback_url,
+                    "grant_type": "authorization_code",
+                },
+            )
+    except Exception:
+        return _fail("token_request_failed")
+    if token_resp.status_code != 200:
+        return _fail("token_exchange_failed")
+    tokens = token_resp.json()
+    id_token_str = tokens.get("id_token")
+    if not id_token_str:
+        return _fail("no_id_token")
+
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            id_token_str, g_requests.Request(), GOOGLE_CLIENT_ID
+        )
+    except ValueError:
+        return _fail("invalid_id_token")
+
+    if not idinfo.get("email_verified", False):
+        return _fail("email_not_verified")
+
+    email = idinfo["email"]
+    name = idinfo.get("name") or email
+    picture = idinfo.get("picture")
+
+    user_id, remember_me = await _upsert_google_user(email, name, picture)
+
+    final_url = f"{FRONTEND_URL}{redirect_to}"
+    response = RedirectResponse(final_url, status_code=302)
+    await _create_session_and_set_cookie(response, user_id, remember_me)
+    return response
+
+
+# --- Legacy: Google ID-Token Popup-Flow (wird vom alten Frontend benutzt) ---
 @api_router.post("/auth/session")
 async def process_session(request: Request, response: Response):
-    """
-    Google OAuth (Identity Services) — Sign-In via ID-Token.
-
-    Frontend schickt das von Google ausgestellte ID-Token (JWT) als
-    `credential` im Body. Wir verifizieren es serverseitig gegen
-    Googles öffentliche Keys und unsere Client-ID, lesen email/name/
-    picture aus dem verifizierten Token und legen den User in MongoDB
-    an bzw. matchen ihn per E-Mail (= nahtlose Migration bestehender
-    Emergent-Auth-User).
-    """
+    """Legacy-Endpoint: nimmt ein Google ID-Token vom Frontend (Popup-Flow)."""
     body = await request.json()
     credential = body.get("credential") or body.get("id_token")
     if not credential:
         raise HTTPException(status_code=400, detail="credential required")
 
-    # Google ID-Token verifizieren (Signatur, Issuer, Audience, Expiry)
     try:
         idinfo = id_token.verify_oauth2_token(
-            credential,
-            g_requests.Request(),
-            GOOGLE_CLIENT_ID,
+            credential, g_requests.Request(), GOOGLE_CLIENT_ID,
         )
     except ValueError as e:
         raise HTTPException(status_code=401, detail=f"Invalid Google token: {e}")
@@ -192,89 +349,8 @@ async def process_session(request: Request, response: Response):
     name = idinfo.get("name") or email
     picture = idinfo.get("picture")
 
-    # User per E-Mail matchen (Bestandsuser-Migration!) oder neu anlegen
-    existing = await db.users.find_one({"email": email}, {"_id": 0})
-    remember_me = True
-    if existing:
-        user_id = existing["user_id"]
-        remember_me = existing.get("remember_me", True)
-        await db.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"name": name, "picture": picture}}
-        )
-    else:
-        user_id = f"user_{uuid.uuid4().hex[:12]}"
-        now = datetime.now(timezone.utc)
-        await db.users.insert_one({
-            "user_id": user_id,
-            "email": email,
-            "name": name,
-            "picture": picture,
-            "created_at": now.isoformat(),
-            "remember_me": True,
-        })
-        await db.user_goals.insert_one({
-            "user_id": user_id,
-            "exercises": [dict(e) for e in DEFAULT_EXERCISES],
-            "boosts": [],
-            "weekly_increase": BASE_INCREASE,
-            "start_date": now.isoformat(),
-        })
-
-    # Eigenes Session-Token erzeugen (vorher kam es von Emergent)
-    session_token = secrets.token_urlsafe(48)
-
-    if remember_me:
-        session_days = 30
-        cookie_max_age = 30 * 24 * 3600
-    else:
-        session_days = 1
-        cookie_max_age = None
-
-    expires_at = datetime.now(timezone.utc) + timedelta(days=session_days)
-    await db.user_sessions.insert_one({
-        "user_id": user_id,
-        "session_token": session_token,
-        "expires_at": expires_at.isoformat(),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/",
-        max_age=cookie_max_age,
-    )
-    return {"user_id": user_id, "email": email, "name": name, "picture": picture}
-
-    # Session-Dauer abhängig von remember_me
-    if remember_me:
-        session_days = 30
-        cookie_max_age = 30 * 24 * 3600
-    else:
-        session_days = 1
-        cookie_max_age = None  # Session-Cookie (Browser-Close => weg)
-
-    expires_at = datetime.now(timezone.utc) + timedelta(days=session_days)
-    await db.user_sessions.insert_one({
-        "user_id": user_id,
-        "session_token": session_token,
-        "expires_at": expires_at.isoformat(),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/",
-        max_age=cookie_max_age,
-    )
+    user_id, remember_me = await _upsert_google_user(email, name, picture)
+    await _create_session_and_set_cookie(response, user_id, remember_me)
     return {"user_id": user_id, "email": email, "name": name, "picture": picture}
 
 
