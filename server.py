@@ -13,10 +13,14 @@ from typing import Optional, List, Set
 import uuid
 from datetime import datetime, timezone, timedelta
 from fastapi.responses import JSONResponse
+import secrets
+from google.oauth2 import id_token
+from google.auth.transport import requests as g_requests
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 mongo_url = os.environ['MONGO_URI']
+GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
@@ -153,29 +157,44 @@ async def get_current_user(request: Request) -> User:
 
 # -------------------- Auth routes --------------------
 
+# REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
 @api_router.post("/auth/session")
 async def process_session(request: Request, response: Response):
+    """
+    Google OAuth (Identity Services) — Sign-In via ID-Token.
+
+    Frontend schickt das von Google ausgestellte ID-Token (JWT) als
+    `credential` im Body. Wir verifizieren es serverseitig gegen
+    Googles öffentliche Keys und unsere Client-ID, lesen email/name/
+    picture aus dem verifizierten Token und legen den User in MongoDB
+    an bzw. matchen ihn per E-Mail (= nahtlose Migration bestehender
+    Emergent-Auth-User).
+    """
     body = await request.json()
-    session_id = body.get("session_id")
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id required")
+    credential = body.get("credential") or body.get("id_token")
+    if not credential:
+        raise HTTPException(status_code=400, detail="credential required")
 
-    async with httpx.AsyncClient(timeout=15.0) as http:
-        r = await http.get(
-            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-            headers={"X-Session-ID": session_id},
+    # Google ID-Token verifizieren (Signatur, Issuer, Audience, Expiry)
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            credential,
+            g_requests.Request(),
+            GOOGLE_CLIENT_ID,
         )
-        if r.status_code != 200:
-            raise HTTPException(status_code=401, detail="Invalid session_id")
-        data = r.json()
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {e}")
 
-    email = data["email"]
-    name = data.get("name", email)
-    picture = data.get("picture")
-    session_token = data["session_token"]
+    if not idinfo.get("email_verified", False):
+        raise HTTPException(status_code=401, detail="Email not verified by Google")
 
+    email = idinfo["email"]
+    name = idinfo.get("name") or email
+    picture = idinfo.get("picture")
+
+    # User per E-Mail matchen (Bestandsuser-Migration!) oder neu anlegen
     existing = await db.users.find_one({"email": email}, {"_id": 0})
-    remember_me = True  # Default für neue User
+    remember_me = True
     if existing:
         user_id = existing["user_id"]
         remember_me = existing.get("remember_me", True)
@@ -194,7 +213,6 @@ async def process_session(request: Request, response: Response):
             "created_at": now.isoformat(),
             "remember_me": True,
         })
-        # default goals
         await db.user_goals.insert_one({
             "user_id": user_id,
             "exercises": [dict(e) for e in DEFAULT_EXERCISES],
@@ -202,6 +220,35 @@ async def process_session(request: Request, response: Response):
             "weekly_increase": BASE_INCREASE,
             "start_date": now.isoformat(),
         })
+
+    # Eigenes Session-Token erzeugen (vorher kam es von Emergent)
+    session_token = secrets.token_urlsafe(48)
+
+    if remember_me:
+        session_days = 30
+        cookie_max_age = 30 * 24 * 3600
+    else:
+        session_days = 1
+        cookie_max_age = None
+
+    expires_at = datetime.now(timezone.utc) + timedelta(days=session_days)
+    await db.user_sessions.insert_one({
+        "user_id": user_id,
+        "session_token": session_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+        max_age=cookie_max_age,
+    )
+    return {"user_id": user_id, "email": email, "name": name, "picture": picture}
 
     # Session-Dauer abhängig von remember_me
     if remember_me:
