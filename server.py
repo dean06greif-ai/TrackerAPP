@@ -13,6 +13,7 @@ from typing import Optional, List, Set
 import uuid
 from datetime import datetime, timezone, timedelta
 import secrets
+import string
 from urllib.parse import urlencode
 from google.oauth2 import id_token
 from google.auth.transport import requests as g_requests
@@ -35,8 +36,16 @@ class User(BaseModel):
     user_id: str
     email: str
     name: str
+    handle: Optional[str] = None  # 5-char unique tag (A-Z, 0-9)
     picture: Optional[str] = None
     created_at: datetime
+
+class FriendAddRequest(BaseModel):
+    name: str
+    handle: str
+
+class FriendOrderUpdate(BaseModel):
+    order: List[str]  # ordered list of friend user_ids
 
 class Exercise(BaseModel):
     key: str
@@ -156,7 +165,35 @@ async def get_current_user(request: Request) -> User:
         raise HTTPException(status_code=401, detail="User not found")
     if isinstance(user_doc.get("created_at"), str):
         user_doc["created_at"] = datetime.fromisoformat(user_doc["created_at"])
+    # Safety net: falls handle noch fehlt (z.B. alter User, vor Backfill abgefragt)
+    if not user_doc.get("handle"):
+        h = await _generate_unique_handle()
+        await db.users.update_one({"user_id": user_doc["user_id"]}, {"$set": {"handle": h}})
+        user_doc["handle"] = h
     return User(**user_doc)
+
+
+# -------------------- Handle (5-char unique tag) --------------------
+# Excluded ambiguous chars (O/0, I/1, L) to keep handles readable when typed manually.
+HANDLE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+async def _generate_unique_handle() -> str:
+    """Erzeugt einen 5-stelligen Handle, der noch nicht vergeben ist."""
+    for _ in range(50):
+        candidate = "".join(secrets.choice(HANDLE_ALPHABET) for _ in range(5))
+        existing = await db.users.find_one({"handle": candidate}, {"_id": 0, "user_id": 1})
+        if not existing:
+            return candidate
+    # Sehr unwahrscheinlich – Fallback mit uuid-Prefix
+    return uuid.uuid4().hex[:5].upper()
+
+
+async def _backfill_handles():
+    """Stellt sicher, dass jeder User einen handle hat (idempotent)."""
+    cursor = db.users.find({"$or": [{"handle": {"$exists": False}}, {"handle": None}, {"handle": ""}]}, {"_id": 0, "user_id": 1})
+    async for u in cursor:
+        h = await _generate_unique_handle()
+        await db.users.update_one({"user_id": u["user_id"]}, {"$set": {"handle": h}})
 
 
 async def _create_session_and_set_cookie(response: Response, user_id: str, remember_me: bool) -> str:
@@ -193,21 +230,29 @@ async def _upsert_google_user(email: str, name: str, picture: Optional[str]) -> 
     if existing:
         user_id = existing["user_id"]
         remember_me = existing.get("remember_me", True)
+        update_set = {"name": name, "picture": picture}
+        # Backfill handle falls noch nicht vorhanden
+        if not existing.get("handle"):
+            update_set["handle"] = await _generate_unique_handle()
         await db.users.update_one(
             {"user_id": user_id},
-            {"$set": {"name": name, "picture": picture}}
+            {"$set": update_set}
         )
         return user_id, remember_me
 
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc)
+    handle = await _generate_unique_handle()
     await db.users.insert_one({
         "user_id": user_id,
         "email": email,
         "name": name,
+        "handle": handle,
         "picture": picture,
         "created_at": now.isoformat(),
         "remember_me": True,
+        "friends": [],
+        "friend_order": [],
     })
     await db.user_goals.insert_one({
         "user_id": user_id,
@@ -798,6 +843,120 @@ async def update_progress(payload: ProgressUpdate, user: User = Depends(get_curr
     })
     return doc
 
+# -------------------- Friends --------------------
+async def _get_friend_ids_ordered(user_id: str) -> List[str]:
+    """Liefert friend user_ids in der gespeicherten Reihenfolge (friend_order)."""
+    udoc = await db.users.find_one({"user_id": user_id}, {"_id": 0, "friends": 1, "friend_order": 1})
+    if not udoc:
+        return []
+    friends = list(udoc.get("friends") or [])
+    order = list(udoc.get("friend_order") or [])
+    # Behalte nur tatsaechliche Freunde im Order; haenge fehlende ans Ende.
+    seen = set()
+    result = []
+    for uid in order:
+        if uid in friends and uid not in seen:
+            result.append(uid)
+            seen.add(uid)
+    for uid in friends:
+        if uid not in seen:
+            result.append(uid)
+            seen.add(uid)
+    return result
+
+
+@api_router.get("/friends")
+async def list_friends(user: User = Depends(get_current_user)):
+    """Liefert die Friend-Liste des aktuellen Users in der gespeicherten Reihenfolge."""
+    ordered_ids = await _get_friend_ids_ordered(user.user_id)
+    if not ordered_ids:
+        return {"friends": []}
+    docs = await db.users.find({"user_id": {"$in": ordered_ids}}, {"_id": 0, "user_id": 1, "name": 1, "handle": 1, "picture": 1}).to_list(500)
+    by_id = {d["user_id"]: d for d in docs}
+    out = []
+    for uid in ordered_ids:
+        d = by_id.get(uid)
+        if not d:
+            continue
+        out.append({
+            "user_id": d["user_id"],
+            "name": d.get("name", ""),
+            "handle": d.get("handle"),
+            "picture": d.get("picture"),
+        })
+    return {"friends": out}
+
+
+@api_router.post("/friends/add")
+async def add_friend(payload: FriendAddRequest, user: User = Depends(get_current_user)):
+    """Fuegt einen Freund per Name + Handle hinzu. Name-Match ist case-insensitive."""
+    handle = (payload.handle or "").strip().upper().lstrip("#")
+    name = (payload.name or "").strip()
+    if not handle or not name:
+        raise HTTPException(status_code=400, detail="Name und Hashtag erforderlich")
+    if len(handle) != 5:
+        raise HTTPException(status_code=400, detail="Hashtag muss 5 Zeichen lang sein")
+
+    target = await db.users.find_one({"handle": handle}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Kein User mit diesem Hashtag")
+    if (target.get("name") or "").strip().lower() != name.lower():
+        raise HTTPException(status_code=404, detail="Name passt nicht zum Hashtag")
+    if target["user_id"] == user.user_id:
+        raise HTTPException(status_code=400, detail="Dich selbst kannst du nicht hinzufügen")
+
+    me_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0, "friends": 1, "friend_order": 1})
+    friends = list((me_doc or {}).get("friends") or [])
+    if target["user_id"] in friends:
+        raise HTTPException(status_code=400, detail="Bereits in deiner Crew")
+    friends.append(target["user_id"])
+    order = list((me_doc or {}).get("friend_order") or [])
+    if target["user_id"] not in order:
+        order.append(target["user_id"])
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$set": {"friends": friends, "friend_order": order}},
+    )
+    return {
+        "ok": True,
+        "friend": {
+            "user_id": target["user_id"],
+            "name": target.get("name", ""),
+            "handle": target.get("handle"),
+            "picture": target.get("picture"),
+        },
+    }
+
+
+@api_router.delete("/friends/{friend_user_id}")
+async def remove_friend(friend_user_id: str, user: User = Depends(get_current_user)):
+    """Entfernt einen Freund aus deiner Crew."""
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$pull": {"friends": friend_user_id, "friend_order": friend_user_id}},
+    )
+    return {"ok": True}
+
+
+@api_router.put("/friends/order")
+async def reorder_friends(payload: FriendOrderUpdate, user: User = Depends(get_current_user)):
+    """Speichert die neue Reihenfolge der Freunde."""
+    me_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0, "friends": 1})
+    friends = set((me_doc or {}).get("friends") or [])
+    # Filter: nur tatsaechliche Freunde, ohne Duplikate, in gegebener Reihenfolge.
+    cleaned = []
+    seen = set()
+    for uid in payload.order:
+        if uid in friends and uid not in seen:
+            cleaned.append(uid)
+            seen.add(uid)
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$set": {"friend_order": cleaned}},
+    )
+    return {"ok": True, "order": cleaned}
+
+
 # -------------------- Live Board (everyone) --------------------
 def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_week: int):
     """A week is 'completed' for streak purposes if every exercise's logged
@@ -847,7 +1006,13 @@ def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_w
 
 @api_router.get("/board")
 async def board(week: Optional[int] = None, user: User = Depends(get_current_user)):
-    users = await db.users.find({}, {"_id": 0}).to_list(100)
+    # Nur ME + meine Freunde anzeigen (in gespeicherter Reihenfolge: ich zuerst, dann Freunde).
+    friend_ids = await _get_friend_ids_ordered(user.user_id)
+    target_ids = [user.user_id] + [fid for fid in friend_ids if fid != user.user_id]
+    users_docs = await db.users.find({"user_id": {"$in": target_ids}}, {"_id": 0}).to_list(500)
+    # In Reihenfolge target_ids bringen
+    by_id = {u["user_id"]: u for u in users_docs}
+    users = [by_id[uid] for uid in target_ids if uid in by_id]
     result = []
     for u in users:
         g = await _load_goals(u["user_id"])
@@ -954,6 +1119,7 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
         result.append({
             "user_id": u["user_id"],
             "name": u["name"],
+            "handle": u.get("handle"),
             "email": u["email"],
             "picture": u.get("picture"),
             "week_number": cur_week,
@@ -1222,6 +1388,20 @@ app.add_middleware(
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+@app.on_event("startup")
+async def startup_db_indexes():
+    # Unique-Index auf handle (sparse, weil alte Docs evtl. noch keinen haben)
+    try:
+        await db.users.create_index("handle", unique=True, sparse=True)
+    except Exception as e:
+        logger.warning(f"handle index create failed: {e}")
+    # Backfill handles fuer bestehende User
+    try:
+        await _backfill_handles()
+    except Exception as e:
+        logger.warning(f"handle backfill failed: {e}")
+
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
