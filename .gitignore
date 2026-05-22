@@ -1,0 +1,27 @@
+# Env files - NEVER commit
+.env
+.env.local
+.env.*.local
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/build/
+
+# Python
+__pycache__/
+*.pyc
+backend/__pycache__/
+backend/venv/
+backend/.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+.vercel
+
+# Old wrongly-named gitignore
+gitignore
