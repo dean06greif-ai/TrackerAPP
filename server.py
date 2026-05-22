@@ -91,24 +91,34 @@ FUTURE_WEEKS = 10  # how many future weeks to project in /goals/me progression
 # -------------------- WebSocket Manager --------------------
 class ConnectionManager:
     def __init__(self):
-        self.active: Set[WebSocket] = set()
+        # ws -> user_id (may be None for unauthenticated connections)
+        self.active: dict = {}
 
-    async def connect(self, ws: WebSocket):
+    async def connect(self, ws: WebSocket, user_id: Optional[str] = None):
         await ws.accept()
-        self.active.add(ws)
+        self.active[ws] = user_id
 
     def disconnect(self, ws: WebSocket):
-        self.active.discard(ws)
+        self.active.pop(ws, None)
+
+    def online_user_ids(self) -> Set[str]:
+        return {uid for uid in self.active.values() if uid}
 
     async def broadcast(self, message: dict):
         dead = []
-        for ws in self.active:
+        for ws in list(self.active.keys()):
             try:
                 await ws.send_json(message)
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            self.active.discard(ws)
+            self.active.pop(ws, None)
+
+    async def broadcast_presence(self):
+        await self.broadcast({
+            "type": "presence_changed",
+            "online_user_ids": list(self.online_user_ids()),
+        })
 
 manager = ConnectionManager()
 
@@ -668,18 +678,22 @@ async def update_progress(payload: ProgressUpdate, user: User = Depends(get_curr
 # -------------------- Live Board (everyone) --------------------
 def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_week: int):
     """A week is 'completed' for streak purposes if every exercise's logged
-    value reached that exercise's at-time goal (i.e. week not in missed list)."""
+    value reached that exercise's at-time goal (i.e. week not in missed list).
+
+    The CURRENT week is now also included: as soon as all targets of the
+    current week are met, the streak ticks up immediately (no need to wait
+    for the week to roll over)."""
     missed_union = set()
     for ex in exercises:
         for w in state[ex["key"]]["missed_weeks"]:
             missed_union.add(w)
 
     completed = []
-    for w in range(1, current_week):  # only past weeks contribute to completion
+    # Include the current week as well, so the streak increments as soon as
+    # all target values of the active week are reached.
+    for w in range(1, current_week + 1):
         if w in missed_union:
             continue
-        # Also require: actually has any logged data for w (otherwise treat as 0 = not completed)
-        # Determine that by checking that the user logged values >= goal for every exercise.
         all_done = True
         for ex in exercises:
             prog = state[ex["key"]]["progression"]
@@ -693,7 +707,9 @@ def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_w
 
     completed_set = set(completed)
     cur = 0
-    w = current_week - 1
+    # Start counting back from the current week (inclusive) so that a freshly
+    # completed current week immediately contributes to the streak.
+    w = current_week
     while w in completed_set:
         cur += 1
         w -= 1
@@ -721,6 +737,12 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
         exercises_out = []
         for ex in g["exercises"]:
             st = state[ex["key"]]
+            # Individuelle wöchentliche Steigerung dieser Übung (1..10 %)
+            try:
+                _pp = int(round(float(ex.get("progression_pct", 10))))
+            except (TypeError, ValueError):
+                _pp = 10
+            _pp = max(1, min(10, _pp))
             exercises_out.append({
                 "key": ex["key"],
                 "name": ex["name"],
@@ -728,6 +750,7 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
                 "icon": ex.get("icon", "pushup"),
                 "color": ex.get("color", "#CCFF00"),
                 "goal": st["current_goal"],
+                "progression_pct": _pp,
                 "boosted_this_week": cur_week in st["effective_boost_weeks"],
                 "boosted_weeks": st["effective_boost_weeks"],
                 "missed_weeks": st["missed_weeks"],
@@ -817,8 +840,9 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
             "updated_at": entry.get("updated_at") if entry else None,
             "streak": streak,
             "all_time": {k: round(v, 2) for k, v in all_time_totals.items()},
+            "is_online": u["user_id"] in manager.online_user_ids(),
         })
-    return {"week_number": week, "users": result}
+    return {"week_number": week, "users": result, "online_user_ids": list(manager.online_user_ids())}
 
 # -------------------- Boost --------------------
 @api_router.post("/boost")
@@ -1010,16 +1034,54 @@ async def insights_me(user: User = Depends(get_current_user)):
     return {"exercises": out, "weeks_tracked": weeks_with_data}
 
 # -------------------- WebSocket --------------------
+async def _resolve_ws_user_id(websocket: WebSocket) -> Optional[str]:
+    """Authenticate WebSocket via session_token (cookie or ?token=... query param)."""
+    token = websocket.cookies.get("session_token")
+    if not token:
+        token = websocket.query_params.get("token")
+    if not token:
+        return None
+    session = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
+    if not session:
+        return None
+    expires_at = session.get("expires_at")
+    if isinstance(expires_at, str):
+        try:
+            expires_at = datetime.fromisoformat(expires_at)
+        except ValueError:
+            return None
+    if expires_at and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at and expires_at < datetime.now(timezone.utc):
+        return None
+    return session.get("user_id")
+
 @api_router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+    user_id = await _resolve_ws_user_id(websocket)
+    await manager.connect(websocket, user_id=user_id)
     try:
+        # Send initial presence snapshot to the connecting client
+        await websocket.send_json({
+            "type": "presence_snapshot",
+            "online_user_ids": list(manager.online_user_ids()),
+        })
+        # Broadcast to others that presence may have changed (only if authenticated)
+        if user_id:
+            await manager.broadcast_presence()
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+        if user_id:
+            await manager.broadcast_presence()
     except Exception:
         manager.disconnect(websocket)
+        if user_id:
+            try:
+                await manager.broadcast_presence()
+            except Exception:
+                pass
 
 @api_router.get("/")
 async def root():
