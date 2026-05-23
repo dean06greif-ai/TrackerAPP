@@ -17,6 +17,7 @@ import string
 from urllib.parse import urlencode
 from google.oauth2 import id_token
 from google.auth.transport import requests as g_requests
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -73,8 +74,8 @@ class BoostRequest(BaseModel):
 
 class ProgressUpdate(BaseModel):
     week_number: int
-    values: Optional[dict] = None  # legacy: total per exercise
-    days: Optional[dict] = None  # new: {"0".."6": {exercise_key: number}}
+    values: Optional[dict] = None    # legacy: total per exercise
+    days: Optional[dict] = None      # new: {"0".."6": {exercise_key: number}}
 
 class ProfileUpdate(BaseModel):
     name: Optional[str] = None
@@ -82,17 +83,15 @@ class ProfileUpdate(BaseModel):
 
 class AuthPreferencesUpdate(BaseModel):
     remember_me: bool
+
 DEFAULT_EXERCISES = [
-    {"key": "ex1", "name": "Lauf", "unit": "km", "icon": "run", "color": "#CCFF00", "base_value": 10.0, "progression_pct": 10},
-    {"key": "ex2", "name": "Liegestütze", "unit": "", "icon": "pushup", "color": "#FF3B30", "base_value": 500, "progression_pct": 10},
-    {"key": "ex3", "name": "Klimmzüge", "unit": "", "icon": "pullup", "color": "#00F0FF", "base_value": 50, "progression_pct": 10},
+    {"key": "ex1", "name": "Lauf",         "unit": "km", "icon": "run",    "color": "#CCFF00", "base_value": 10.0,  "progression_pct": 10},
+    {"key": "ex2", "name": "Liegestütze",  "unit": "",   "icon": "pushup", "color": "#FF3B30", "base_value": 500,   "progression_pct": 10},
+    {"key": "ex3", "name": "Klimmzüge",    "unit": "",   "icon": "pullup", "color": "#00F0FF", "base_value": 50,    "progression_pct": 10},
 ]
-# Verbindliche Farb-Palette: Position bestimmt Farbe (Ziel 1..5).
-# Ziel 4 = Orange (#FF8800), Ziel 5 = Violett (#A855F7) für deutlichen Kontrast zu Standard-Zielen.
 EXERCISE_PALETTE = ["#CCFF00", "#FF3B30", "#00F0FF", "#FF8800", "#A855F7"]
 
 def _normalize_exercise_colors(exercises: list) -> list:
-    """Erzwingt die Palette-Farbe basierend auf der Position. Mutiert die Liste in-place und gibt sie zurück."""
     if not exercises:
         return exercises
     for idx, ex in enumerate(exercises):
@@ -102,12 +101,11 @@ def _normalize_exercise_colors(exercises: list) -> list:
 
 BASE_INCREASE = 0.10
 BOOST_INCREASE = 0.25
-FUTURE_WEEKS = 10  # how many future weeks to project in /goals/me progression
+FUTURE_WEEKS = 10
 
 # -------------------- WebSocket Manager --------------------
 class ConnectionManager:
     def __init__(self):
-        # ws -> user_id (may be None for unauthenticated connections)
         self.active: dict = {}
 
     async def connect(self, ws: WebSocket, user_id: Optional[str] = None):
@@ -165,53 +163,42 @@ async def get_current_user(request: Request) -> User:
         raise HTTPException(status_code=401, detail="User not found")
     if isinstance(user_doc.get("created_at"), str):
         user_doc["created_at"] = datetime.fromisoformat(user_doc["created_at"])
-    # Safety net: falls handle noch fehlt (z.B. alter User, vor Backfill abgefragt)
     if not user_doc.get("handle"):
         h = await _generate_unique_handle()
         await db.users.update_one({"user_id": user_doc["user_id"]}, {"$set": {"handle": h}})
         user_doc["handle"] = h
     return User(**user_doc)
 
-
 # -------------------- Handle (5-char unique tag) --------------------
-# Excluded ambiguous chars (O/0, I/1, L) to keep handles readable when typed manually.
 HANDLE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 async def _generate_unique_handle() -> str:
-    """Erzeugt einen 5-stelligen Handle, der noch nicht vergeben ist."""
     for _ in range(50):
         candidate = "".join(secrets.choice(HANDLE_ALPHABET) for _ in range(5))
         existing = await db.users.find_one({"handle": candidate}, {"_id": 0, "user_id": 1})
         if not existing:
             return candidate
-    # Sehr unwahrscheinlich – Fallback mit uuid-Prefix
     return uuid.uuid4().hex[:5].upper()
 
-
 async def _backfill_handles():
-    """Stellt sicher, dass jeder User einen handle hat (idempotent)."""
     cursor = db.users.find({"$or": [{"handle": {"$exists": False}}, {"handle": None}, {"handle": ""}]}, {"_id": 0, "user_id": 1})
     async for u in cursor:
         h = await _generate_unique_handle()
         await db.users.update_one({"user_id": u["user_id"]}, {"$set": {"handle": h}})
 
 
-async def _create_session_and_set_cookie(response: Response, user_id: str, remember_me: bool) -> str:
-    """Erstellt eine DB-Session + setzt den session_token Cookie. Gibt den Token zurück."""
-    session_token = secrets.token_urlsafe(48)
-    if remember_me:
-        session_days = 30
-        cookie_max_age = 30 * 24 * 3600
-    else:
-        session_days = 1
-        cookie_max_age = None  # Session-Cookie
-    expires_at = datetime.now(timezone.utc) + timedelta(days=session_days)
-    await db.user_sessions.insert_one({
-        "user_id": user_id,
-        "session_token": session_token,
-        "expires_at": expires_at.isoformat(),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
+# -------------------- Session/Cookie Helpers --------------------
+# session_hint: Nicht-HttpOnly Cookie. Wird parallel zum echten session_token
+# gesetzt und ist vom Frontend (document.cookie) lesbar. Erlaubt dem Frontend,
+# beim ersten Page-Load schnell zu entscheiden, ob ein /auth/me Roundtrip
+# Sinn macht (spart bei Render Cold Starts mehrere Sekunden Ladezeit).
+# Enthält bewusst KEINE Geheimnisse — nur die Existenz zählt.
+SESSION_HINT_COOKIE = "session_hint"
+
+
+def _set_session_cookies(response: Response, session_token: str, cookie_max_age: Optional[int]):
+    """Setzt sowohl das echte HttpOnly session_token Cookie als auch das
+    nicht-HttpOnly session_hint Cookie. cookie_max_age=None -> Session-Cookie."""
     response.set_cookie(
         key="session_token",
         value=session_token,
@@ -221,17 +208,43 @@ async def _create_session_and_set_cookie(response: Response, user_id: str, remem
         path="/",
         max_age=cookie_max_age,
     )
+    response.set_cookie(
+        key=SESSION_HINT_COOKIE,
+        value="1",
+        httponly=False,
+        secure=True,
+        samesite="none",
+        path="/",
+        max_age=cookie_max_age,
+    )
+
+
+async def _create_session_and_set_cookie(response: Response, user_id: str, remember_me: bool) -> str:
+    """Erstellt eine DB-Session + setzt session_token + session_hint Cookies.
+    Gibt den Token zurück (wird zusätzlich im OAuth-Callback ins URL-Fragment gehängt)."""
+    session_token = secrets.token_urlsafe(48)
+    if remember_me:
+        session_days = 30
+        cookie_max_age = 30 * 24 * 3600
+    else:
+        session_days = 1
+        cookie_max_age = None
+    expires_at = datetime.now(timezone.utc) + timedelta(days=session_days)
+    await db.user_sessions.insert_one({
+        "user_id": user_id,
+        "session_token": session_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    _set_session_cookies(response, session_token, cookie_max_age)
     return session_token
 
-
 async def _upsert_google_user(email: str, name: str, picture: Optional[str]) -> tuple[str, bool]:
-    """Legt User an oder updated. Gibt (user_id, remember_me) zurück."""
     existing = await db.users.find_one({"email": email}, {"_id": 0})
     if existing:
         user_id = existing["user_id"]
         remember_me = existing.get("remember_me", True)
         update_set = {"name": name, "picture": picture}
-        # Backfill handle falls noch nicht vorhanden
         if not existing.get("handle"):
             update_set["handle"] = await _generate_unique_handle()
         await db.users.update_one(
@@ -263,19 +276,11 @@ async def _upsert_google_user(email: str, name: str, picture: Optional[str]) -> 
     })
     return user_id, True
 
-
 # -------------------- Auth routes --------------------
-
-# --- Google OAuth 2.0 Authorization Code Flow (Server-Side Redirect) ---
-# Frontend Button -> GET /api/auth/google/login -> 302 zu Google -> User waehlt Konto
-# -> Google 302 zu /api/auth/google/callback?code=... -> Backend tauscht Code,
-# erstellt Session, setzt Cookie, 302 zu FRONTEND_URL/dashboard.
 
 @api_router.get("/auth/google/login")
 async def google_login_start(redirect: str = "/dashboard"):
-    """Startet den OAuth-Flow und redirected den Browser zu Googles Consent-Screen."""
     state = secrets.token_urlsafe(24)
-    # Nur Pfade auf dem Frontend zulassen (kein open redirect)
     if not redirect.startswith("/"):
         redirect = "/dashboard"
     await db.oauth_states.insert_one({
@@ -297,14 +302,20 @@ async def google_login_start(redirect: str = "/dashboard"):
     google_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
     return RedirectResponse(google_url, status_code=302)
 
-
 @api_router.get("/auth/google/callback")
 async def google_callback(
     code: Optional[str] = None,
     state: Optional[str] = None,
     error: Optional[str] = None,
 ):
-    """OAuth Callback: tauscht Code gegen ID-Token, erstellt Session, redirected zum Frontend."""
+    """OAuth Callback: tauscht Code gegen ID-Token, erstellt Session, redirected zum Frontend.
+
+    Der Session-Token wird sowohl als HttpOnly-Cookie gesetzt ALS AUCH als
+    URL-Fragment (#token=...) an die Redirect-URL angehaengt. Letzteres ist
+    der Fallback fuer Browser/Webviews, die cross-site Cookies blockieren
+    (Google-In-App-Browser, Safari mit Cross-Site-Tracking verhindern, ...).
+    URL-Fragments werden nie an Server gesendet -> kein Leak ueber Logs/Referer.
+    """
     def _fail(reason: str) -> RedirectResponse:
         return RedirectResponse(f"{FRONTEND_URL}/?auth_error={reason}", status_code=302)
 
@@ -313,7 +324,6 @@ async def google_callback(
     if not code or not state:
         return _fail("missing_params")
 
-    # Cleanup alter States (>10min) — async, best-effort
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
     try:
         await db.oauth_states.delete_many({"created_at": {"$lt": cutoff}})
@@ -365,13 +375,15 @@ async def google_callback(
 
     user_id, remember_me = await _upsert_google_user(email, name, picture)
 
-    final_url = f"{FRONTEND_URL}{redirect_to}"
-    response = RedirectResponse(final_url, status_code=302)
-    await _create_session_and_set_cookie(response, user_id, remember_me)
+    # Erst eine Response mit der Basis-URL erstellen (damit set_cookie geht),
+    # dann den Token holen und ans Fragment haengen.
+    base_url = f"{FRONTEND_URL}{redirect_to}"
+    response = RedirectResponse(base_url, status_code=302)
+    session_token = await _create_session_and_set_cookie(response, user_id, remember_me)
+    # Token im URL-Fragment mitgeben (Bearer-Fallback fuer Webviews/Tracker-Blocker).
+    response.headers["location"] = f"{base_url}#token={session_token}"
     return response
 
-
-# --- Legacy: Google ID-Token Popup-Flow (wird vom alten Frontend benutzt) ---
 @api_router.post("/auth/session")
 async def process_session(request: Request, response: Response):
     """Legacy-Endpoint: nimmt ein Google ID-Token vom Frontend (Popup-Flow)."""
@@ -395,13 +407,18 @@ async def process_session(request: Request, response: Response):
     picture = idinfo.get("picture")
 
     user_id, remember_me = await _upsert_google_user(email, name, picture)
-    await _create_session_and_set_cookie(response, user_id, remember_me)
-    return {"user_id": user_id, "email": email, "name": name, "picture": picture}
-
+    session_token = await _create_session_and_set_cookie(response, user_id, remember_me)
+    # Token zusaetzlich im Body zurueckgeben (Bearer-Fallback bei Cookie-Block).
+    return {
+        "user_id": user_id,
+        "email": email,
+        "name": name,
+        "picture": picture,
+        "session_token": session_token,
+    }
 
 @api_router.get("/auth/me")
 async def me(request: Request, response: Response, user: User = Depends(get_current_user)):
-    # Sliding session: bei aktiven Nutzern Session automatisch verlängern
     user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
     if user_doc and user_doc.get("remember_me", True):
         token = request.cookies.get("session_token")
@@ -415,31 +432,26 @@ async def me(request: Request, response: Response, user: User = Depends(get_curr
                 {"session_token": token},
                 {"$set": {"expires_at": new_expires.isoformat()}}
             )
-            response.set_cookie(
-                key="session_token",
-                value=token,
-                httponly=True,
-                secure=True,
-                samesite="none",
-                path="/",
-                max_age=30 * 24 * 3600,
-            )
+            _set_session_cookies(response, token, 30 * 24 * 3600)
     return user.model_dump(mode="json")
 
 @api_router.post("/auth/logout")
 async def logout(request: Request, response: Response):
     token = request.cookies.get("session_token")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
     if token:
         await db.user_sessions.delete_one({"session_token": token})
     response.delete_cookie("session_token", path="/", samesite="none", secure=True)
+    response.delete_cookie(SESSION_HINT_COOKIE, path="/", samesite="none", secure=True)
     return {"ok": True}
-
 
 @api_router.get("/auth/preferences")
 async def get_auth_prefs(user: User = Depends(get_current_user)):
     user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
     return {"remember_me": bool(user_doc.get("remember_me", True)) if user_doc else True}
-
 
 @api_router.put("/auth/preferences")
 async def set_auth_prefs(
@@ -465,43 +477,28 @@ async def set_auth_prefs(
             cookie_max_age = 30 * 24 * 3600
         else:
             new_expires = datetime.now(timezone.utc) + timedelta(days=1)
-            cookie_max_age = None  # Session-Cookie
+            cookie_max_age = None
         await db.user_sessions.update_one(
             {"session_token": token},
             {"$set": {"expires_at": new_expires.isoformat()}}
         )
-        response.set_cookie(
-            key="session_token",
-            value=token,
-            httponly=True,
-            secure=True,
-            samesite="none",
-            path="/",
-            max_age=cookie_max_age,
-        )
+        _set_session_cookies(response, token, cookie_max_age)
     return {"remember_me": payload.remember_me}
+
 # -------------------- Goals --------------------
 def _calc_week_number(start_date: datetime) -> int:
-    """ISO calendar week count. Week 1 = the calendar week (Mo-So) containing start_date.
-    A new week begins every Monday at 00:00."""
     if start_date.tzinfo is None:
         start_date = start_date.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
-    # Anchor each date to the Monday of its ISO week
     start_monday = (start_date - timedelta(days=start_date.weekday())).date()
     today_monday = (now - timedelta(days=now.weekday())).date()
     return max(1, (today_monday - start_monday).days // 7 + 1)
 
 def _round_goal(value: float, unit: str) -> float:
-    """Round goal for clean display. km/distance -> 0.1 (100m). Reps -> nearest integer (half up)."""
     u = (unit or "").lower()
     if "km" in u or "m" == u or "mi" in u:
-        # Half-up Rundung auf 1 Nachkommastelle (vermeidet Python banker's rounding)
         return float(int(value * 10 + 0.5)) / 10.0
-    # Reps & sonstige Einheiten: auf nächste ganze Zahl runden (half up, nicht banker's)
-    # Wichtig: nicht auf gerade Zahlen runden -> sonst wird 100 + 25% Boost = 125 fälschlich zu 124
     return float(int(value + 0.5))
-
 
 async def _load_goals(user_id: str) -> dict:
     g = await db.user_goals.find_one({"user_id": user_id}, {"_id": 0})
@@ -516,12 +513,11 @@ async def _load_goals(user_id: str) -> dict:
         }
         await db.user_goals.insert_one(dict(g))
         return g
-    # Migrate legacy schema -> exercises[]
     if "exercises" not in g:
         legacy = [
-            {"key": "ex1", "name": "Lauf", "unit": "km", "icon": "run", "color": "#CCFF00", "base_value": float(g.get("base_run_km", 10.0))},
-            {"key": "ex2", "name": "Liegestütze", "unit": "", "icon": "pushup", "color": "#FF3B30", "base_value": float(g.get("base_pushups", 500))},
-            {"key": "ex3", "name": "Klimmzüge", "unit": "", "icon": "pullup", "color": "#00F0FF", "base_value": float(g.get("base_pullups", 50))},
+            {"key": "ex1", "name": "Lauf",         "unit": "km", "icon": "run",    "color": "#CCFF00", "base_value": float(g.get("base_run_km", 10.0))},
+            {"key": "ex2", "name": "Liegestütze",  "unit": "",   "icon": "pushup", "color": "#FF3B30", "base_value": float(g.get("base_pushups", 500))},
+            {"key": "ex3", "name": "Klimmzüge",    "unit": "",   "icon": "pullup", "color": "#00F0FF", "base_value": float(g.get("base_pullups", 50))},
         ]
         await db.user_goals.update_one(
             {"user_id": user_id},
@@ -533,14 +529,11 @@ async def _load_goals(user_id: str) -> dict:
     if "boosts" not in g:
         g["boosts"] = []
         await db.user_goals.update_one({"user_id": user_id}, {"$set": {"boosts": []}})
-    # Erzwinge Palette-Farbe je nach Position (Ziel 4 = Orange, Ziel 5 = Violett)
     _normalize_exercise_colors(g.get("exercises", []))
-    # Stelle sicher, dass jede Übung einen progression_pct (1..10) hat — Default 10
     _ensure_progression_pct(g.get("exercises", []))
     return g
 
 def _ensure_progression_pct(exercises: list) -> list:
-    """Setzt/clamped das progression_pct-Feld jeder Übung auf einen int in [1, 10]."""
     if not exercises:
         return exercises
     for ex in exercises:
@@ -556,9 +549,7 @@ def _ensure_progression_pct(exercises: list) -> list:
 def _boosted_weeks_for(g: dict, exercise_key: str) -> set:
     return {b["week_number"] for b in g.get("boosts", []) if b.get("exercise_key") == exercise_key}
 
-
 async def _progress_by_week(user_id: str, exercises: list) -> dict:
-    """Returns dict {week_number: {exercise_key: total_logged_value}}."""
     entries = await db.progress_entries.find({"user_id": user_id}, {"_id": 0}).to_list(1000)
     out = {}
     ex_keys = {e["key"] for e in exercises}
@@ -569,7 +560,6 @@ async def _progress_by_week(user_id: str, exercises: list) -> dict:
         if "values" in pe:
             out[wn] = {k: float(v or 0) for k, v in pe["values"].items() if k in ex_keys}
         else:
-            # legacy
             legacy = {
                 "ex1": float(pe.get("run_km", 0) or 0),
                 "ex2": float(pe.get("pushups", 0) or 0),
@@ -578,35 +568,12 @@ async def _progress_by_week(user_id: str, exercises: list) -> dict:
             out[wn] = {k: v for k, v in legacy.items() if k in ex_keys}
     return out
 
-
 def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week: dict,
-                          current_week: int, future_weeks: int = FUTURE_WEEKS) -> dict:
-    """Compute per-week progression for a single exercise.
-
-    Rules:
-      • Each completed past week → +10% progression carries forward.
-      • Missed past week (logged < goal) → +10% paused for that week (no carry-forward).
-      • Boosts in week W add +25% multiplicatively from week W onwards.
-      • If any week is missed, ALL boosts on this exercise from prior or that week
-        are voided (no longer count anywhere).
-      • For weeks > current_week, we project assuming user completes them (no missed),
-        carrying forward whatever boosts survived up to current_week.
-
-    Returns:
-        {
-          "missed_weeks": [..],
-          "effective_boost_weeks": [..],   # boosts still active at/after current week
-          "current_goal": float,           # rounded current week goal
-          "progression": [
-            {"week", "goal", "status", "boost", "voided_boost"}, ...
-          ]
-        }
-    """
+                        current_week: int, future_weeks: int = FUTURE_WEEKS) -> dict:
     base = float(exercise.get("base_value", 0) or 0)
     unit = exercise.get("unit", "")
     ex_key = exercise["key"]
 
-    # Individuelle wöchentliche Steigerung dieser Übung (Default 10 %, geclamped 1..10)
     try:
         pct = int(round(float(exercise.get("progression_pct", 10))))
     except (TypeError, ValueError):
@@ -614,15 +581,14 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
     pct = max(1, min(10, pct))
     ex_increase = pct / 100.0
 
-    eff_idx = 0           # +x% multipliers applied so far
-    active_boosts = []    # list of boost weeks still effective
+    eff_idx = 0
+    active_boosts = []
     missed = []
     progression = []
 
     last_week = max(current_week, 1) + future_weeks
 
     for w in range(1, last_week + 1):
-        # Apply boost made this week (before computing this week's goal)
         boost_this_week = w in all_boost_weeks
         if boost_this_week:
             active_boosts.append(w)
@@ -633,12 +599,10 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
         if w < current_week:
             logged = float(progress_by_week.get(w, {}).get(ex_key, 0) or 0)
             if logged + 1e-9 < goal_rounded:
-                # MISSED
                 missed.append(w)
-                # Void all boosts up to and including this week (boost "fliegt raus")
                 active_boosts = [b for b in active_boosts if b > w]
                 status = "missed"
-                voided_boost = boost_this_week  # boost this week is also voided
+                voided_boost = boost_this_week
             else:
                 status = "completed"
                 voided_boost = False
@@ -646,10 +610,7 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
         elif w == current_week:
             status = "current"
             voided_boost = False
-            # Note: do NOT increment eff_idx here; current week's success is unknown.
-            # The projection for w+1 below uses (eff_idx + 1) assuming user completes it.
         else:
-            # future weeks: assume completion. Increment eff_idx AFTER computing this week.
             status = "future"
             voided_boost = False
 
@@ -661,14 +622,11 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
             "voided_boost": voided_boost,
         })
 
-        # For future weeks (status="future") we assume completion → carry +10%
         if status == "future":
             eff_idx += 1
-        # For the current week, the projection of next week assumes completion → carry +10%
         elif status == "current":
             eff_idx += 1
 
-    # Find current week's entry for current_goal
     current_goal = next((p["goal"] for p in progression if p["week"] == current_week), 0)
 
     return {
@@ -678,9 +636,7 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
         "progression": progression,
     }
 
-
 async def _compute_user_state(user_id: str, g: dict, current_week: int) -> dict:
-    """Returns per-exercise progression bundle (see _compute_progression)."""
     exercises = g["exercises"]
     progress_by_week = await _progress_by_week(user_id, exercises)
     state = {}
@@ -688,7 +644,6 @@ async def _compute_user_state(user_id: str, g: dict, current_week: int) -> dict:
         bws = _boosted_weeks_for(g, ex["key"])
         state[ex["key"]] = _compute_progression(ex, bws, progress_by_week, current_week)
     return state
-
 
 @api_router.get("/goals/me")
 async def get_my_goals(user: User = Depends(get_current_user)):
@@ -699,7 +654,7 @@ async def get_my_goals(user: User = Depends(get_current_user)):
     cur_week = _calc_week_number(sd)
     state = await _compute_user_state(user.user_id, g, cur_week)
     g["current_week"] = cur_week
-    g["state"] = state  # per-exercise progression bundle
+    g["state"] = state
     return g
 
 @api_router.put("/goals/me")
@@ -707,37 +662,30 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
     g = await _load_goals(user.user_id)
     if not (3 <= len(payload.exercises) <= 5):
         raise HTTPException(status_code=400, detail="Es müssen 3 bis 5 Übungen sein")
-    # ensure unique keys
     keys = [e.key for e in payload.exercises]
     if len(set(keys)) != len(keys):
         raise HTTPException(status_code=400, detail="Übungs-Keys müssen eindeutig sein")
     exercises = [e.model_dump() for e in payload.exercises]
-    # Farben gemäß Palette normalisieren (verhindert, dass alte Farben aus Frontend übernommen werden)
     _normalize_exercise_colors(exercises)
-    # progression_pct nochmals normalisieren (Sicherheitsnetz auch wenn Pydantic schon validiert)
     _ensure_progression_pct(exercises)
 
-    # --- Lock-Regeln: Startwert nach Woche 1 nicht änderbar, Progression nur 1x je 4 Wochen ---
     sd = g["start_date"]
     if isinstance(sd, str):
         sd = datetime.fromisoformat(sd)
     cur_week = _calc_week_number(sd)
-    PROGRESSION_COOLDOWN = 4  # Wochen
+    PROGRESSION_COOLDOWN = 4
     old_by_key = {e["key"]: e for e in g.get("exercises", [])}
     for ex in exercises:
         old = old_by_key.get(ex["key"])
         if not old:
-            # Neue Übung -> ab Woche 2 ist Hinzufügen erlaubt, aber merken wann progression "gesetzt" wurde
             ex["progression_last_changed_week"] = cur_week
             continue
-        # Startwert nach Woche 1 NICHT änderbar -> erzwinge alten Wert
         if cur_week > 1:
             try:
                 if float(ex.get("base_value", 0)) != float(old.get("base_value", 0)):
                     ex["base_value"] = float(old.get("base_value", 0))
             except (TypeError, ValueError):
                 ex["base_value"] = float(old.get("base_value", 0))
-        # Progression-Cooldown: in Woche 1 immer frei, sonst nur alle 4 Wochen
         old_pct = int(old.get("progression_pct", 10))
         new_pct = int(ex.get("progression_pct", 10))
         last_changed = int(old.get("progression_last_changed_week", 1))
@@ -763,7 +711,6 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
 @api_router.post("/goals/me/reset-start")
 async def reset_start_date(user: User = Depends(get_current_user)):
     now = datetime.now(timezone.utc).isoformat()
-    # Hole aktuelle Goals, setze für alle Übungen progression_last_changed_week auf 1
     g = await db.user_goals.find_one({"user_id": user.user_id}, {"_id": 0})
     exercises = g.get("exercises", []) if g else []
     for ex in exercises:
@@ -772,7 +719,6 @@ async def reset_start_date(user: User = Depends(get_current_user)):
         {"user_id": user.user_id},
         {"$set": {"start_date": now, "exercises": exercises, "last_streak": 0}},
     )
-    # Alte Fortschritts-Einträge & Boosts löschen, damit man wirklich bei Null startet
     await db.progress_entries.delete_many({"user_id": user.user_id})
     await db.user_goals.update_one(
         {"user_id": user.user_id},
@@ -802,7 +748,6 @@ async def my_progress(week: Optional[int] = None, user: User = Depends(get_curre
             "updated_at": None,
         }
     elif "values" not in entry:
-        # legacy migration
         entry["values"] = {
             "ex1": entry.get("run_km", 0),
             "ex2": entry.get("pushups", 0),
@@ -814,7 +759,6 @@ async def my_progress(week: Optional[int] = None, user: User = Depends(get_curre
 async def update_progress(payload: ProgressUpdate, user: User = Depends(get_current_user)):
     now = datetime.now(timezone.utc).isoformat()
     days = payload.days or {}
-    # Compute totals from days, or fall back to direct values
     if days:
         totals = {}
         for d, vals in days.items():
@@ -845,13 +789,11 @@ async def update_progress(payload: ProgressUpdate, user: User = Depends(get_curr
 
 # -------------------- Friends --------------------
 async def _get_friend_ids_ordered(user_id: str) -> List[str]:
-    """Liefert friend user_ids in der gespeicherten Reihenfolge (friend_order)."""
     udoc = await db.users.find_one({"user_id": user_id}, {"_id": 0, "friends": 1, "friend_order": 1})
     if not udoc:
         return []
     friends = list(udoc.get("friends") or [])
     order = list(udoc.get("friend_order") or [])
-    # Behalte nur tatsaechliche Freunde im Order; haenge fehlende ans Ende.
     seen = set()
     result = []
     for uid in order:
@@ -864,10 +806,8 @@ async def _get_friend_ids_ordered(user_id: str) -> List[str]:
             seen.add(uid)
     return result
 
-
 @api_router.get("/friends")
 async def list_friends(user: User = Depends(get_current_user)):
-    """Liefert die Friend-Liste des aktuellen Users in der gespeicherten Reihenfolge."""
     ordered_ids = await _get_friend_ids_ordered(user.user_id)
     if not ordered_ids:
         return {"friends": []}
@@ -886,10 +826,8 @@ async def list_friends(user: User = Depends(get_current_user)):
         })
     return {"friends": out}
 
-
 @api_router.post("/friends/add")
 async def add_friend(payload: FriendAddRequest, user: User = Depends(get_current_user)):
-    """Fuegt einen Freund per Name + Handle hinzu. Name-Match ist case-insensitive."""
     handle = (payload.handle or "").strip().upper().lstrip("#")
     name = (payload.name or "").strip()
     if not handle or not name:
@@ -927,23 +865,18 @@ async def add_friend(payload: FriendAddRequest, user: User = Depends(get_current
         },
     }
 
-
 @api_router.delete("/friends/{friend_user_id}")
 async def remove_friend(friend_user_id: str, user: User = Depends(get_current_user)):
-    """Entfernt einen Freund aus deiner Crew."""
     await db.users.update_one(
         {"user_id": user.user_id},
         {"$pull": {"friends": friend_user_id, "friend_order": friend_user_id}},
     )
     return {"ok": True}
 
-
 @api_router.put("/friends/order")
 async def reorder_friends(payload: FriendOrderUpdate, user: User = Depends(get_current_user)):
-    """Speichert die neue Reihenfolge der Freunde."""
     me_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0, "friends": 1})
     friends = set((me_doc or {}).get("friends") or [])
-    # Filter: nur tatsaechliche Freunde, ohne Duplikate, in gegebener Reihenfolge.
     cleaned = []
     seen = set()
     for uid in payload.order:
@@ -956,23 +889,14 @@ async def reorder_friends(payload: FriendOrderUpdate, user: User = Depends(get_c
     )
     return {"ok": True, "order": cleaned}
 
-
-# -------------------- Live Board (everyone) --------------------
+# -------------------- Live Board --------------------
 def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_week: int):
-    """A week is 'completed' for streak purposes if every exercise's logged
-    value reached that exercise's at-time goal (i.e. week not in missed list).
-
-    The CURRENT week is now also included: as soon as all targets of the
-    current week are met, the streak ticks up immediately (no need to wait
-    for the week to roll over)."""
     missed_union = set()
     for ex in exercises:
         for w in state[ex["key"]]["missed_weeks"]:
             missed_union.add(w)
 
     completed = []
-    # Include the current week as well, so the streak increments as soon as
-    # all target values of the active week are reached.
     for w in range(1, current_week + 1):
         if w in missed_union:
             continue
@@ -989,8 +913,6 @@ def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_w
 
     completed_set = set(completed)
     cur = 0
-    # Start counting back from the current week (inclusive) so that a freshly
-    # completed current week immediately contributes to the streak.
     w = current_week
     while w in completed_set:
         cur += 1
@@ -1006,11 +928,9 @@ def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_w
 
 @api_router.get("/board")
 async def board(week: Optional[int] = None, user: User = Depends(get_current_user)):
-    # Nur ME + meine Freunde anzeigen (in gespeicherter Reihenfolge: ich zuerst, dann Freunde).
     friend_ids = await _get_friend_ids_ordered(user.user_id)
     target_ids = [user.user_id] + [fid for fid in friend_ids if fid != user.user_id]
     users_docs = await db.users.find({"user_id": {"$in": target_ids}}, {"_id": 0}).to_list(500)
-    # In Reihenfolge target_ids bringen
     by_id = {u["user_id"]: u for u in users_docs}
     users = [by_id[uid] for uid in target_ids if uid in by_id]
     result = []
@@ -1025,7 +945,6 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
         exercises_out = []
         for ex in g["exercises"]:
             st = state[ex["key"]]
-            # Individuelle wöchentliche Steigerung dieser Übung (1..10 %)
             try:
                 _pp = int(round(float(ex.get("progression_pct", 10))))
             except (TypeError, ValueError):
@@ -1055,10 +974,6 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
             }
         values = entry["values"] if entry else {e["key"]: 0 for e in g["exercises"]}
         days = entry.get("days", {}) if entry else {}
-        # All-Time-Total: Summe aller geloggten Werte je Übung über ALLE Wochen.
-        # Direkt aus progress_entries lesen (robust gegen fehlende/leere values-Felder).
-        # Quelle-der-Wahrheit-Reihenfolge: days -> values -> legacy.
-        # Nach reset-start ist progress_entries leer => all_time_totals = 0 (automatisch).
         all_time_totals = {ex["key"]: 0.0 for ex in g["exercises"]}
         all_entries = await db.progress_entries.find(
             {"user_id": u["user_id"]}, {"_id": 0}
@@ -1067,7 +982,6 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
             week_vals = {}
             pe_days = pe.get("days") or {}
             if pe_days:
-                # Bevorzugt: aus days aggregieren (source of truth)
                 for d_key, d_vals in pe_days.items():
                     if not isinstance(d_vals, dict):
                         continue
@@ -1077,14 +991,12 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
                         except (TypeError, ValueError):
                             continue
             elif pe.get("values"):
-                # Fallback: aggregiertes values-Feld
                 for k, v in (pe.get("values") or {}).items():
                     try:
                         week_vals[k] = float(v or 0)
                     except (TypeError, ValueError):
                         continue
             else:
-                # Legacy-Schema vor exercises[]
                 week_vals = {
                     "ex1": float(pe.get("run_km", 0) or 0),
                     "ex2": float(pe.get("pushups", 0) or 0),
@@ -1141,10 +1053,8 @@ async def boost_exercise(payload: BoostRequest, user: User = Depends(get_current
     if isinstance(sd, str):
         sd = datetime.fromisoformat(sd)
     cur_week = _calc_week_number(sd)
-    # validate exercise key
     if not any(e["key"] == payload.exercise_key for e in g["exercises"]):
         raise HTTPException(status_code=400, detail="Unknown exercise")
-    # max 1 boost per user per week (across exercises)
     if any(b["week_number"] == cur_week for b in g.get("boosts", [])):
         raise HTTPException(status_code=400, detail="Du hast diese Woche bereits geboostet")
     new_boost = {
@@ -1200,7 +1110,6 @@ async def boost_ranking(user: User = Depends(get_current_user)):
             sd = datetime.fromisoformat(sd)
         cur_week = _calc_week_number(sd)
         state = await _compute_user_state(u["user_id"], g, cur_week)
-        # Build effective boost list = boost records whose week is in effective_boost_weeks
         effective_records = []
         for b in g.get("boosts", []):
             ek = b.get("exercise_key")
@@ -1231,7 +1140,6 @@ async def update_profile(payload: ProfileUpdate, user: User = Depends(get_curren
     if payload.name is not None and payload.name.strip():
         update["name"] = payload.name.strip()[:80]
     if payload.picture is not None:
-        # accept data: URL or http(s) URL; cap size at ~500KB
         p = payload.picture
         if len(p) > 700_000:
             raise HTTPException(status_code=400, detail="Bild zu groß (max ~500KB)")
@@ -1243,7 +1151,7 @@ async def update_profile(payload: ProfileUpdate, user: User = Depends(get_curren
     updated = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
     return updated
 
-# -------------------- Insights (Power-Day) --------------------
+# -------------------- Insights --------------------
 @api_router.get("/insights/me")
 async def insights_me(user: User = Depends(get_current_user)):
     g = await _load_goals(user.user_id)
@@ -1252,18 +1160,16 @@ async def insights_me(user: User = Depends(get_current_user)):
     entries = await db.progress_entries.find({"user_id": user.user_id}, {"_id": 0}).to_list(1000)
 
     by_weekday = {k: [0.0] * 7 for k in ex_keys}
-    weeks_active = {k: [0] * 7 for k in ex_keys}  # weeks where user trained on this weekday
+    weeks_active = {k: [0] * 7 for k in ex_keys}
     weeks_with_data = 0
 
     for entry in entries:
         raw_days = entry.get("days") or {}
         if not isinstance(raw_days, dict) or not raw_days:
-            # Legacy total-only entry oder leeres days-Feld: skip
             continue
         active_today = {k: [False] * 7 for k in ex_keys}
-        week_contributed = False  # nur Wochen mit >0 Werten als "tracked" zählen
+        week_contributed = False
         for d_key, d_vals in raw_days.items():
-            # Day-Key kann string ("0".."6") oder int sein -> robust parsen
             try:
                 d = int(d_key)
             except (ValueError, TypeError):
@@ -1293,7 +1199,6 @@ async def insights_me(user: User = Depends(get_current_user)):
         k = ex["key"]
         u = (ex.get("unit", "") or "").lower()
         is_distance = "km" in u or u == "m" or "mi" in u
-        # Reps -> ganze Zahlen, Distanz -> 0.1 Auflösung (passend zu _round_goal)
         if is_distance:
             totals = [round(v, 1) for v in by_weekday[k]]
         else:
@@ -1324,7 +1229,6 @@ async def insights_me(user: User = Depends(get_current_user)):
 
 # -------------------- WebSocket --------------------
 async def _resolve_ws_user_id(websocket: WebSocket) -> Optional[str]:
-    """Authenticate WebSocket via session_token (cookie or ?token=... query param)."""
     token = websocket.cookies.get("session_token")
     if not token:
         token = websocket.query_params.get("token")
@@ -1350,12 +1254,10 @@ async def websocket_endpoint(websocket: WebSocket):
     user_id = await _resolve_ws_user_id(websocket)
     await manager.connect(websocket, user_id=user_id)
     try:
-        # Send initial presence snapshot to the connecting client
         await websocket.send_json({
             "type": "presence_snapshot",
             "online_user_ids": list(manager.online_user_ids()),
         })
-        # Broadcast to others that presence may have changed (only if authenticated)
         if user_id:
             await manager.broadcast_presence()
         while True:
@@ -1391,17 +1293,14 @@ logger = logging.getLogger(__name__)
 
 @app.on_event("startup")
 async def startup_db_indexes():
-    # Unique-Index auf handle (sparse, weil alte Docs evtl. noch keinen haben)
     try:
         await db.users.create_index("handle", unique=True, sparse=True)
     except Exception as e:
         logger.warning(f"handle index create failed: {e}")
-    # Backfill handles fuer bestehende User
     try:
         await _backfill_handles()
     except Exception as e:
         logger.warning(f"handle backfill failed: {e}")
-
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
