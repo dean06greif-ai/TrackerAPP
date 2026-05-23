@@ -188,11 +188,6 @@ async def _backfill_handles():
 
 
 # -------------------- Session/Cookie Helpers --------------------
-# session_hint: Nicht-HttpOnly Cookie. Wird parallel zum echten session_token
-# gesetzt und ist vom Frontend (document.cookie) lesbar. Erlaubt dem Frontend,
-# beim ersten Page-Load schnell zu entscheiden, ob ein /auth/me Roundtrip
-# Sinn macht (spart bei Render Cold Starts mehrere Sekunden Ladezeit).
-# Enthält bewusst KEINE Geheimnisse — nur die Existenz zählt.
 SESSION_HINT_COOKIE = "session_hint"
 
 
@@ -308,14 +303,7 @@ async def google_callback(
     state: Optional[str] = None,
     error: Optional[str] = None,
 ):
-    """OAuth Callback: tauscht Code gegen ID-Token, erstellt Session, redirected zum Frontend.
-
-    Der Session-Token wird sowohl als HttpOnly-Cookie gesetzt ALS AUCH als
-    URL-Fragment (#token=...) an die Redirect-URL angehaengt. Letzteres ist
-    der Fallback fuer Browser/Webviews, die cross-site Cookies blockieren
-    (Google-In-App-Browser, Safari mit Cross-Site-Tracking verhindern, ...).
-    URL-Fragments werden nie an Server gesendet -> kein Leak ueber Logs/Referer.
-    """
+    """OAuth Callback: tauscht Code gegen ID-Token, erstellt Session, redirected zum Frontend."""
     def _fail(reason: str) -> RedirectResponse:
         return RedirectResponse(f"{FRONTEND_URL}/?auth_error={reason}", status_code=302)
 
@@ -375,12 +363,9 @@ async def google_callback(
 
     user_id, remember_me = await _upsert_google_user(email, name, picture)
 
-    # Erst eine Response mit der Basis-URL erstellen (damit set_cookie geht),
-    # dann den Token holen und ans Fragment haengen.
     base_url = f"{FRONTEND_URL}{redirect_to}"
     response = RedirectResponse(base_url, status_code=302)
     session_token = await _create_session_and_set_cookie(response, user_id, remember_me)
-    # Token im URL-Fragment mitgeben (Bearer-Fallback fuer Webviews/Tracker-Blocker).
     response.headers["location"] = f"{base_url}#token={session_token}"
     return response
 
@@ -408,7 +393,6 @@ async def process_session(request: Request, response: Response):
 
     user_id, remember_me = await _upsert_google_user(email, name, picture)
     session_token = await _create_session_and_set_cookie(response, user_id, remember_me)
-    # Token zusaetzlich im Body zurueckgeben (Bearer-Fallback bei Cookie-Block).
     return {
         "user_id": user_id,
         "email": email,
