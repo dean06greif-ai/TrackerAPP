@@ -56,6 +56,7 @@ class Exercise(BaseModel):
     color: str = "#CCFF00"
     base_value: float = 0
     progression_pct: int = 10  # 1..10 — individuelle wöchentliche Steigerung in %
+    added_week: Optional[int] = None  # In welcher Programm-Woche die Übung hinzugefügt wurde
 
     @field_validator("progression_pct")
     @classmethod
@@ -667,19 +668,33 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
     for ex in exercises:
         old = old_by_key.get(ex["key"])
         if not old:
+            # Neue Übung -> in dieser Woche hinzugefügt, voll editierbar bis nächste Woche
+            ex["added_week"] = cur_week
             ex["progression_last_changed_week"] = cur_week
             continue
-        if cur_week > 1:
+        # Bestehende Übung: added_week unverändert übernehmen
+        if old.get("added_week") is not None:
+            ex["added_week"] = int(old.get("added_week"))
+        elif ex.get("added_week") is None:
+            ex["added_week"] = 1  # Legacy: alte Übungen ohne added_week -> Woche 1
+        # In der Hinzufüge-Woche dürfen Startwert/Einheit/Steigerung frei geändert werden.
+        added_week = int(ex.get("added_week") or 1)
+        weeks_since_added = cur_week - added_week + 1
+        is_new_in_first_week = weeks_since_added <= 1
+        if cur_week > 1 and not is_new_in_first_week:
             try:
                 if float(ex.get("base_value", 0)) != float(old.get("base_value", 0)):
                     ex["base_value"] = float(old.get("base_value", 0))
             except (TypeError, ValueError):
                 ex["base_value"] = float(old.get("base_value", 0))
+            # Einheit ebenfalls ab Woche 2 (nach Hinzufügen) gesperrt
+            if (ex.get("unit") or "") != (old.get("unit") or ""):
+                ex["unit"] = old.get("unit") or ""
         old_pct = int(old.get("progression_pct", 10))
         new_pct = int(ex.get("progression_pct", 10))
-        last_changed = int(old.get("progression_last_changed_week", 1))
+        last_changed = int(old.get("progression_last_changed_week", added_week))
         if new_pct != old_pct:
-            if cur_week > 1 and (cur_week - last_changed) < PROGRESSION_COOLDOWN:
+            if not is_new_in_first_week and cur_week > 1 and (cur_week - last_changed) < PROGRESSION_COOLDOWN:
                 weeks_left = PROGRESSION_COOLDOWN - (cur_week - last_changed)
                 raise HTTPException(
                     status_code=400,
@@ -704,6 +719,7 @@ async def reset_start_date(user: User = Depends(get_current_user)):
     exercises = g.get("exercises", []) if g else []
     for ex in exercises:
         ex["progression_last_changed_week"] = 1
+        ex["added_week"] = 1
     await db.user_goals.update_one(
         {"user_id": user.user_id},
         {"$set": {"start_date": now, "exercises": exercises, "last_streak": 0}},
