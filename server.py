@@ -582,7 +582,12 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
 
         if w < current_week:
             logged = float(progress_by_week.get(w, {}).get(ex_key, 0) or 0)
-            if logged + 1e-9 < goal_rounded:
+            # Float-Toleranz: 0.5% vom Ziel, mindestens 0.01.
+            # Verhindert, dass akkumulierte Float-Rundungsfehler aus dem
+            # Tages-Modus (Mo-So) eine erfuellte Woche faelschlich als
+            # "missed" markieren und damit den Streak zerstoeren.
+            tol = max(0.01, goal_rounded * 0.005)
+            if logged + tol < goal_rounded:
                 missed.append(w)
                 active_boosts = [b for b in active_boosts if b > w]
                 status = "missed"
@@ -889,7 +894,11 @@ def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_w
             prog = state[ex["key"]]["progression"]
             target = next((p["goal"] for p in prog if p["week"] == w), None)
             logged = float(progress_by_week.get(w, {}).get(ex["key"], 0) or 0)
-            if target is None or logged + 1e-9 < target:
+            # Gleiche Toleranz wie in _compute_progression: 0.5% vom Ziel,
+            # mindestens 0.01. Sonst wuerden Float-Summen aus dem Tages-Modus
+            # eine erfuellte Woche faelschlich als nicht completed werten.
+            tol = max(0.01, (target or 0) * 0.005)
+            if target is None or logged + tol < target:
                 all_done = False
                 break
         if all_done:
@@ -897,8 +906,14 @@ def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_w
 
     completed_set = set(completed)
     cur = 0
+    # Starte beim aktuellen Wochen-Index. Wenn die aktuelle Woche noch nicht
+    # abgeschlossen ist (z.B. gerade erst gestartet), wird ab der Vorwoche
+    # gezählt – sonst würde der Streak beim Wochenwechsel fälschlicherweise
+    # auf 0 fallen, obwohl die Vorwoche(n) erledigt waren.
     w = current_week
-    while w in completed_set:
+    if w not in completed_set:
+        w -= 1
+    while w >= 1 and w in completed_set:
         cur += 1
         w -= 1
     best = 0
