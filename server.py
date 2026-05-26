@@ -1023,6 +1023,10 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
         streak = _streak_info(state, g["exercises"], progress_by_week, cur_week)
         last_streak = int(g.get("last_streak", 0))
         cur_streak = int(streak["current"])
+        # pending_failed_week: wird gesetzt, wenn die Woche tatsächlich gefailt wurde
+        # (Streak ist von >0 auf 0 gefallen). Wird beim ersten Anzeigen der
+        # Animation vom Frontend per Endpoint wieder gecleared.
+        pending_failed_week = int(g.get("pending_failed_week") or 0)
         if cur_streak != last_streak:
             if cur_streak > last_streak:
                 await manager.broadcast({
@@ -1033,12 +1037,22 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
                     "streak": cur_streak,
                 })
             elif last_streak > 0 and cur_streak == 0:
+                # Die zuletzt vollendete Woche wäre cur_week - 1 (die gerade
+                # vergangene). Diese Nummer wird gespeichert UND mitgesendet,
+                # damit das Frontend "Week N failed" anzeigen kann.
+                failed_week_num = max(1, cur_week - 1)
+                pending_failed_week = failed_week_num
                 await manager.broadcast({
                     "type": "streak_ended",
                     "user_id": u["user_id"],
                     "user_name": u["name"],
                     "previous_streak": last_streak,
+                    "failed_week": failed_week_num,
                 })
+                await db.user_goals.update_one(
+                    {"user_id": u["user_id"]},
+                    {"$set": {"pending_failed_week": failed_week_num}},
+                )
             await db.user_goals.update_one(
                 {"user_id": u["user_id"]},
                 {"$set": {"last_streak": cur_streak}},
@@ -1057,8 +1071,60 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
             "streak": streak,
             "all_time": {k: round(v, 2) for k, v in all_time_totals.items()},
             "is_online": u["user_id"] in manager.online_user_ids(),
+            # Nur für eigenen Eintrag relevant. Wird vom Frontend genutzt, um die
+            # "Week N failed"-Animation einmalig beim Öffnen der neuen Woche zu zeigen.
+            "pending_failed_week": pending_failed_week if u["user_id"] == user.user_id else 0,
         })
     return {"week_number": week, "users": result, "online_user_ids": list(manager.online_user_ids())}
+
+# -------------------- Seen Effects (Animationen pro Viewer 1× pro Event) --------------------
+# Ziel: Wenn jemand die Usercard eines anderen Users öffnet, soll die
+# Celebration-/Failed-Animation für diese (target_user_id, week_number, type)
+# nur EINMAL pro Viewer abgespielt werden – auch über Page-Reloads hinweg.
+# Daher persistieren wir die "gesehen"-Markierung pro Viewer in der DB.
+
+class SeenEffectMark(BaseModel):
+    target_user_id: str
+    week_number: int
+    type: str  # "celebration" | "failure"
+
+    @field_validator("type")
+    @classmethod
+    def _validate_type(cls, v):
+        if v not in ("celebration", "failure"):
+            raise ValueError("type must be celebration|failure")
+        return v
+
+@api_router.get("/me/seen-effects")
+async def get_seen_effects(user: User = Depends(get_current_user)):
+    docs = await db.seen_effects.find(
+        {"viewer_user_id": user.user_id},
+        {"_id": 0, "target_user_id": 1, "week_number": 1, "type": 1},
+    ).to_list(5000)
+    return {"items": docs}
+
+@api_router.post("/me/seen-effects")
+async def mark_seen_effect(payload: SeenEffectMark, user: User = Depends(get_current_user)):
+    key = {
+        "viewer_user_id": user.user_id,
+        "target_user_id": payload.target_user_id,
+        "week_number": int(payload.week_number),
+        "type": payload.type,
+    }
+    await db.seen_effects.update_one(
+        key,
+        {"$set": {**key, "seen_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+@api_router.post("/me/clear-pending-failed-week")
+async def clear_pending_failed_week(user: User = Depends(get_current_user)):
+    await db.user_goals.update_one(
+        {"user_id": user.user_id},
+        {"$set": {"pending_failed_week": 0}},
+    )
+    return {"ok": True}
 
 # -------------------- Boost --------------------
 @api_router.post("/boost")
