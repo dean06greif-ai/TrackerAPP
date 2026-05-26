@@ -1277,7 +1277,14 @@ async def insights_me(user: User = Depends(get_current_user)):
             round(100 * weeks_active[k][d] / reachable_per_day[d]) if reachable_per_day[d] > 0 else 0
             for d in range(7)
         ]
-        avg = round(total_sum / weeks_with_data, 2) if weeks_with_data > 0 else 0
+        # Tages-basierter Wochendurchschnitt: total / (verstrichene Programm-Tage) * 7.
+        # Beispiel: 10km in Woche 1, Montag Woche 2 -> 10 / 8 * 7 = 8.75 km/Woche.
+        total_days_elapsed = (current_week_num - 1) * 7 + current_dow + 1
+        if total_days_elapsed > 0 and total_sum > 0:
+            avg_raw = total_sum / total_days_elapsed * 7
+            avg = round(avg_raw, 1) if is_distance else round(avg_raw, 2)
+        else:
+            avg = 0
         out.append({
             "key": k,
             "name": ex["name"],
