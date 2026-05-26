@@ -1174,8 +1174,22 @@ async def insights_me(user: User = Depends(get_current_user)):
     ex_keys = {e["key"] for e in exercises}
     entries = await db.progress_entries.find({"user_id": user.user_id}, {"_id": 0}).to_list(1000)
 
+    # Aktuelle Woche + heutiger Wochentag (0=Mo .. 6=So) für "erreichbare Tage"-Logik
+    sd = g.get("start_date")
+    if isinstance(sd, str):
+        try:
+            sd = datetime.fromisoformat(sd)
+        except ValueError:
+            sd = datetime.now(timezone.utc)
+    if not isinstance(sd, datetime):
+        sd = datetime.now(timezone.utc)
+    current_week_num = _calc_week_number(sd)
+    current_dow = datetime.now(timezone.utc).weekday()  # 0=Mo..6=So
+
     by_weekday = {k: [0.0] * 7 for k in ex_keys}
     weeks_active = {k: [0] * 7 for k in ex_keys}
+    # Pro Wochentag: in wie vielen protokollierten Wochen war dieser Tag bereits erreichbar?
+    reachable_per_day = [0] * 7
     weeks_with_data = 0
 
     for entry in entries:
@@ -1208,6 +1222,20 @@ async def insights_me(user: User = Depends(get_current_user)):
                 for i, was_active in enumerate(flags):
                     if was_active:
                         weeks_active[k][i] += 1
+            # Erreichbarkeit der Wochentage in dieser Woche bestimmen.
+            # - Vergangene Wochen: alle 7 Tage erreichbar.
+            # - Aktuelle (oder spätere) Woche: nur Tage bis einschließlich heute.
+            try:
+                week_num = int(entry.get("week_number", 0))
+            except (ValueError, TypeError):
+                week_num = 0
+            if week_num < current_week_num:
+                for d in range(7):
+                    reachable_per_day[d] += 1
+            else:
+                for d in range(7):
+                    if d <= current_dow:
+                        reachable_per_day[d] += 1
 
     out = []
     for ex in exercises:
@@ -1219,11 +1247,36 @@ async def insights_me(user: User = Depends(get_current_user)):
         else:
             totals = [float(int(v + 0.5)) for v in by_weekday[k]]
         total_sum = sum(totals)
+
+        # Power-Day: Tag mit dem höchsten Wert (>0)
         nonzero = [(i, v) for i, v in enumerate(totals) if v > 0]
         power_day = max(nonzero, key=lambda x: x[1])[0] if nonzero else None
-        weakest_day = min(nonzero, key=lambda x: x[1])[0] if nonzero else None
+
+        # Loser-Day: Tag mit dem geringsten Wert (0 explizit erlaubt) — über alle
+        # bereits erreichbaren Wochentage. Mehrere Tage mit gleichem Minimum
+        # werden alle als Loser-Days zurückgegeben (z.B. mehrere 0-Tage).
+        reachable_indices = [i for i in range(7) if reachable_per_day[i] > 0]
+        if reachable_indices:
+            min_val = min(totals[i] for i in reachable_indices)
+            weakest_days = [i for i in reachable_indices if totals[i] == min_val]
+            # Falls Power-Day == einziger Loser-Day (alle Werte gleich), keinen Loser zeigen
+            if len(weakest_days) == 1 and weakest_days[0] == power_day:
+                weakest_days = []
+            elif power_day is not None and power_day in weakest_days:
+                weakest_days = [i for i in weakest_days if i != power_day]
+            weakest_day = weakest_days[0] if weakest_days else None
+        else:
+            weakest_days = []
+            weakest_day = None
+
         share_per_day = [round(100 * t / total_sum, 1) if total_sum > 0 else 0 for t in totals]
-        consistency = [round(100 * wa / weeks_with_data) if weeks_with_data > 0 else 0 for wa in weeks_active[k]]
+        # Konsistenz: % der erreichbaren Wochen mit Aktivität an diesem Tag.
+        # Nenner ist NICHT mehr weeks_with_data, sondern reachable_per_day[d]
+        # — damit zukünftige Tage der laufenden Woche die Quote nicht drücken.
+        consistency = [
+            round(100 * weeks_active[k][d] / reachable_per_day[d]) if reachable_per_day[d] > 0 else 0
+            for d in range(7)
+        ]
         avg = round(total_sum / weeks_with_data, 2) if weeks_with_data > 0 else 0
         out.append({
             "key": k,
@@ -1235,7 +1288,8 @@ async def insights_me(user: User = Depends(get_current_user)):
             "share_per_day": share_per_day,
             "consistency": consistency,
             "power_day": power_day,
-            "weakest_day": weakest_day,
+            "weakest_day": weakest_day,      # Backward-Compat: erster Loser-Day
+            "weakest_days": weakest_days,    # Neu: Liste aller Loser-Days
             "total": round(total_sum, 2),
             "avg_per_week": avg,
         })
