@@ -650,8 +650,8 @@ async def get_my_goals(user: User = Depends(get_current_user)):
 @api_router.put("/goals/me")
 async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current_user)):
     g = await _load_goals(user.user_id)
-    if not (3 <= len(payload.exercises) <= 5):
-        raise HTTPException(status_code=400, detail="Es müssen 3 bis 5 Übungen sein")
+    if not (3 <= len(payload.exercises) <= 7):
+        raise HTTPException(status_code=400, detail="Es müssen 3 bis 7 Übungen sein")
     keys = [e.key for e in payload.exercises]
     if len(set(keys)) != len(keys):
         raise HTTPException(status_code=400, detail="Übungs-Keys müssen eindeutig sein")
