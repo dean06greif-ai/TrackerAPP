@@ -630,6 +630,16 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
     pct = max(0, min(10, pct))
     ex_increase = pct / 100.0
 
+    # Übung existiert erst ab dieser Woche. Frühere Wochen werden weder als
+    # "missed" markiert noch zählen sie in die Streak — sie hatten ja gar keine
+    # Vorgabe, weil die Übung damals noch gar nicht im Plan war.
+    try:
+        added_week = int(exercise.get("added_week") or 1)
+    except (TypeError, ValueError):
+        added_week = 1
+    if added_week < 1:
+        added_week = 1
+
     eff_idx = 0
     active_boosts = []
     missed = []
@@ -638,6 +648,19 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
     last_week = max(current_week, 1) + future_weeks
 
     for w in range(1, last_week + 1):
+        # Vor der Hinzufüge-Woche: Übung existiert noch nicht — komplett ignorieren.
+        # KEIN goal, KEIN missed, KEIN boost. Frontend kann diesen Status nutzen,
+        # um die Zelle in der Wochenprogression leer/ausgegraut zu rendern.
+        if w < added_week:
+            progression.append({
+                "week": w,
+                "goal": 0,
+                "status": "pre_existence",
+                "boost": False,
+                "voided_boost": False,
+            })
+            continue
+
         boost_this_week = w in all_boost_weeks
         if boost_this_week:
             active_boosts.append(w)
@@ -688,6 +711,7 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
         "effective_boost_weeks": sorted(active_boosts),
         "current_goal": current_goal,
         "progression": progression,
+        "added_week": added_week,
     }
 
 async def _compute_user_state(user_id: str, g: dict, current_week: int) -> dict:
@@ -981,6 +1005,14 @@ async def reorder_friends(payload: FriendOrderUpdate, user: User = Depends(get_c
 
 # -------------------- Live Board --------------------
 def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_week: int):
+    # Helper: in welcher Woche wurde diese Übung dem Plan hinzugefügt?
+    def _ex_added_week(ex):
+        try:
+            v = int(ex.get("added_week") or 1)
+        except (TypeError, ValueError):
+            v = 1
+        return v if v >= 1 else 1
+
     missed_union = set()
     for ex in exercises:
         for w in state[ex["key"]]["missed_weeks"]:
@@ -991,7 +1023,13 @@ def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_w
         if w in missed_union:
             continue
         all_done = True
+        any_active = False  # mind. eine Übung muss in dieser Woche bereits existiert haben
         for ex in exercises:
+            # Übung existierte in dieser Woche noch nicht -> überspringen,
+            # darf weder Streak verhindern noch erzwingen.
+            if _ex_added_week(ex) > w:
+                continue
+            any_active = True
             prog = state[ex["key"]]["progression"]
             target = next((p["goal"] for p in prog if p["week"] == w), None)
             logged = float(progress_by_week.get(w, {}).get(ex["key"], 0) or 0)
@@ -1002,7 +1040,7 @@ def _streak_info(state: dict, exercises: list, progress_by_week: dict, current_w
             if target is None or logged + tol < target:
                 all_done = False
                 break
-        if all_done:
+        if all_done and any_active:
             completed.append(w)
 
     completed_set = set(completed)
@@ -1061,6 +1099,11 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
                 "boosted_this_week": cur_week in st["effective_boost_weeks"],
                 "boosted_weeks": st["effective_boost_weeks"],
                 "missed_weeks": st["missed_weeks"],
+                # Ab welcher Woche existiert diese Übung im Plan? Wochen davor
+                # werden vom Backend bewusst aus Streak/Progression ausgeklammert,
+                # das Frontend kann diesen Wert nutzen, um die entsprechenden
+                # Zellen leer/ausgegraut zu rendern.
+                "added_week": int(ex.get("added_week") or 1),
             })
         entry = await db.progress_entries.find_one(
             {"user_id": u["user_id"], "week_number": cur_week},
