@@ -1451,6 +1451,30 @@ async def startup_db_indexes():
         await _backfill_handles()
     except Exception as e:
         logger.warning(f"handle backfill failed: {e}")
+    # One-time migration: Dean's Week-Streak wurde versehentlich auf 0 zurueckgesetzt.
+    # Wir setzen last_streak einmalig wieder auf 1, idempotent ueber die Marker-
+    # Collection "migrations". Nach erfolgreichem Lauf wird der Code nicht mehr
+    # aktiv, auch wenn der Server neu startet.
+    try:
+        MIGRATION_KEY = "restore_streak_user_6b2cbac4692f_v1"
+        already = await db.migrations.find_one({"_id": MIGRATION_KEY})
+        if not already:
+            res = await db.user_goals.update_one(
+                {"user_id": "user_6b2cbac4692f"},
+                {"$set": {"last_streak": 1, "pending_failed_week": 0}},
+            )
+            await db.migrations.insert_one({
+                "_id": MIGRATION_KEY,
+                "ran_at": datetime.now(timezone.utc).isoformat(),
+                "matched": res.matched_count,
+                "modified": res.modified_count,
+            })
+            logger.info(
+                f"[migration {MIGRATION_KEY}] last_streak=1 für user_6b2cbac4692f gesetzt "
+                f"(matched={res.matched_count}, modified={res.modified_count})"
+            )
+    except Exception as e:
+        logger.warning(f"restore-streak migration failed: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
