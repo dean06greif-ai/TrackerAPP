@@ -475,8 +475,16 @@ def _calc_week_number(start_date: datetime) -> int:
     if start_date.tzinfo is None:
         start_date = start_date.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
+    
     start_monday = (start_date - timedelta(days=start_date.weekday())).date()
-    today_monday = (now - timedelta(days=now.weekday())).date()
+    current_weekday = now.weekday()
+    
+    # Sonntag (6) gehört noch zur aktuellen Woche!
+    if current_weekday == 6:
+        today_monday = (now - timedelta(days=6)).date()
+    else:
+        today_monday = (now - timedelta(days=current_weekday)).date()
+    
     return max(1, (today_monday - start_monday).days // 7 + 1)
 
 def _round_goal(value: float, unit: str) -> float:
