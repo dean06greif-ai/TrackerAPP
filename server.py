@@ -55,8 +55,9 @@ class Exercise(BaseModel):
     icon: str = "pushup"
     color: str = "#CCFF00"
     base_value: float = 0
-    progression_pct: int = 10  # 1..10 — individuelle wöchentliche Steigerung in %
+    progression_pct: int = 10  # 0..10 — individuelle wöchentliche Steigerung in %
     added_week: Optional[int] = None  # In welcher Programm-Woche die Übung hinzugefügt wurde
+    is_default: Optional[bool] = None  # True = Standard-Übung (Lauf/Liegestütze/Klimmzüge) - nach Woche 1 nicht mehr löschbar
 
     @field_validator("progression_pct")
     @classmethod
@@ -65,7 +66,7 @@ class Exercise(BaseModel):
             v = int(round(float(v)))
         except (TypeError, ValueError):
             v = 10
-        return max(1, min(10, v))
+        return max(0, min(10, v))
 
 class GoalsUpdate(BaseModel):
     exercises: List[Exercise]
@@ -85,10 +86,16 @@ class ProfileUpdate(BaseModel):
 class AuthPreferencesUpdate(BaseModel):
     remember_me: bool
 
+class LiveSaveUpdate(BaseModel):
+    live_save_enabled: bool
+
+class CustomStepsUpdate(BaseModel):
+    custom_steps: dict
+
 DEFAULT_EXERCISES = [
-    {"key": "ex1", "name": "Lauf",         "unit": "km", "icon": "run",    "color": "#CCFF00", "base_value": 10.0,  "progression_pct": 10},
-    {"key": "ex2", "name": "Liegestütze",  "unit": "",   "icon": "pushup", "color": "#FF3B30", "base_value": 500,   "progression_pct": 10},
-    {"key": "ex3", "name": "Klimmzüge",    "unit": "",   "icon": "pullup", "color": "#00F0FF", "base_value": 50,    "progression_pct": 10},
+    {"key": "ex1", "name": "Lauf",         "unit": "km", "icon": "run",    "color": "#CCFF00", "base_value": 10.0,  "progression_pct": 10, "is_default": True},
+    {"key": "ex2", "name": "Liegestütze",  "unit": "",   "icon": "pushup", "color": "#FF3B30", "base_value": 500,   "progression_pct": 10, "is_default": True},
+    {"key": "ex3", "name": "Klimmzüge",    "unit": "",   "icon": "pullup", "color": "#00F0FF", "base_value": 50,    "progression_pct": 10, "is_default": True},
 ]
 EXERCISE_PALETTE = ["#CCFF00", "#FF3B30", "#00F0FF", "#FF8800", "#A855F7"]
 
@@ -470,6 +477,55 @@ async def set_auth_prefs(
         _set_session_cookies(response, token, cookie_max_age)
     return {"remember_me": payload.remember_me}
 
+# -------------------- Live-Save Preference --------------------
+@api_router.get("/me/live-save")
+async def get_live_save(user: User = Depends(get_current_user)):
+    user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    return {"live_save_enabled": bool(user_doc.get("live_save_enabled", False)) if user_doc else False}
+
+@api_router.put("/me/live-save")
+async def set_live_save(payload: LiveSaveUpdate, user: User = Depends(get_current_user)):
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$set": {"live_save_enabled": bool(payload.live_save_enabled)}}
+    )
+    return {"live_save_enabled": bool(payload.live_save_enabled)}
+
+# -------------------- Custom Steps (Schrittweiten) --------------------
+# Pro User wird ein Dictionary { exerciseKey: stepValue } persistiert,
+# damit die im Dashboard ("Fortschritt eintragen") eingestellten
+# Schrittweiten der + / – Buttons geräteübergreifend identisch sind.
+def _sanitize_custom_steps(raw: dict) -> dict:
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        if not isinstance(k, str) or not k:
+            continue
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0 and n < 1_000_000:
+            # Ganze Zahlen ohne Nachkommastellen sauber als int speichern
+            out[k] = int(n) if n.is_integer() else n
+    return out
+
+@api_router.get("/me/custom-steps")
+async def get_custom_steps(user: User = Depends(get_current_user)):
+    user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    steps = (user_doc or {}).get("custom_steps") or {}
+    return {"custom_steps": _sanitize_custom_steps(steps)}
+
+@api_router.put("/me/custom-steps")
+async def set_custom_steps(payload: CustomStepsUpdate, user: User = Depends(get_current_user)):
+    cleaned = _sanitize_custom_steps(payload.custom_steps)
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$set": {"custom_steps": cleaned}}
+    )
+    return {"custom_steps": cleaned}
+
 # -------------------- Goals --------------------
 def _calc_week_number(start_date: datetime) -> int:
     if start_date.tzinfo is None:
@@ -536,7 +592,7 @@ def _ensure_progression_pct(exercises: list) -> list:
             v = int(round(float(ex.get("progression_pct", 10))))
         except (TypeError, ValueError):
             v = 10
-        ex["progression_pct"] = max(1, min(10, v))
+        ex["progression_pct"] = max(0, min(10, v))
     return exercises
 
 def _boosted_weeks_for(g: dict, exercise_key: str) -> set:
@@ -571,7 +627,7 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
         pct = int(round(float(exercise.get("progression_pct", 10))))
     except (TypeError, ValueError):
         pct = 10
-    pct = max(1, min(10, pct))
+    pct = max(0, min(10, pct))
     ex_increase = pct / 100.0
 
     eff_idx = 0
@@ -673,18 +729,39 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
     cur_week = _calc_week_number(sd)
     PROGRESSION_COOLDOWN = 4
     old_by_key = {e["key"]: e for e in g.get("exercises", [])}
+    # Schutz: Standard-Übungen (is_default=True) dürfen ab Woche 2 nicht mehr gelöscht werden
+    new_keys = {e["key"] for e in exercises}
+    if cur_week > 1:
+        for old_ex in g.get("exercises", []):
+            is_def = bool(old_ex.get("is_default")) or (
+                old_ex.get("is_default") is None
+                and int(old_ex.get("added_week") or 1) == 1
+                and old_ex.get("key") in ("ex1", "ex2", "ex3")
+            )
+            if is_def and old_ex["key"] not in new_keys:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Standard-Übung '{old_ex.get('name')}' kann ab Woche 2 nicht mehr gelöscht werden",
+                )
     for ex in exercises:
         old = old_by_key.get(ex["key"])
         if not old:
             # Neue Übung -> in dieser Woche hinzugefügt, voll editierbar bis nächste Woche
             ex["added_week"] = cur_week
             ex["progression_last_changed_week"] = cur_week
+            ex["is_default"] = False  # benutzerdefinierte Übungen sind nie "default"
             continue
         # Bestehende Übung: added_week unverändert übernehmen
         if old.get("added_week") is not None:
             ex["added_week"] = int(old.get("added_week"))
         elif ex.get("added_week") is None:
             ex["added_week"] = 1  # Legacy: alte Übungen ohne added_week -> Woche 1
+        # is_default-Flag immer aus der bestehenden Übung übernehmen, damit Clients es nicht überschreiben können
+        if old.get("is_default") is not None:
+            ex["is_default"] = bool(old.get("is_default"))
+        elif int(ex.get("added_week") or 1) == 1 and ex["key"] in ("ex1", "ex2", "ex3"):
+            # Legacy-Migration: alte Daten ohne is_default - die ursprünglichen 3 Default-Übungen markieren
+            ex["is_default"] = True
         # In der Hinzufüge-Woche dürfen Startwert/Einheit/Steigerung frei geändert werden.
         added_week = int(ex.get("added_week") or 1)
         weeks_since_added = cur_week - added_week + 1
