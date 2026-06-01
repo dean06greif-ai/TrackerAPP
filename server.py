@@ -281,6 +281,17 @@ async def _upsert_google_user(email: str, name: str, picture: Optional[str]) -> 
 
 # -------------------- Auth routes --------------------
 
+@api_router.get("/health")
+async def health_check():
+    """
+    Schlanker Health-Check für Render-Cold-Start-Aufwachen.
+    KEIN DB-Zugriff, keine Auth, kein Logging-Overhead — nur OK.
+    Wird vom Frontend Custom-Wake-Screen gepingt, um Render aus dem
+    Sleep zu holen, BEVOR der Nutzer auf /api/auth/google/login navigiert.
+    Damit sieht der Nutzer Renders Default-Loading-Page gar nicht erst.
+    """
+    return {"ok": True}
+
 @api_router.get("/auth/google/login")
 async def google_login_start(redirect: str = "/dashboard"):
     state = secrets.token_urlsafe(24)
