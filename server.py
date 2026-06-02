@@ -1129,6 +1129,25 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
         values = entry["values"] if entry else {e["key"]: 0 for e in g["exercises"]}
         days = entry.get("days", {}) if entry else {}
         all_time_totals = {ex["key"]: 0.0 for ex in g["exercises"]}
+        # 🏆 Rang-Bestwert pro Übung: höchster je in EINER Woche „erspielter"
+        #    Wert (= min(weekValue, weekGoal)). Damit bleiben einmal erreichte
+        #    Ränge auch dann erhalten, wenn in einer späteren Woche das Ziel
+        #    nicht (oder noch nicht) erfüllt wird. Wird vom Frontend für die
+        #    Rang-Anzeige auf der Kartenrückseite genutzt – als verlässliche
+        #    Quelle der Wahrheit zusätzlich/an Stelle des lokalen Speichers,
+        #    damit der Rang auch auf fremden Geräten, in anderen Browsern und
+        #    beim Anzeigen fremder Karten korrekt erscheint.
+        best_goals = {ex["key"]: 0.0 for ex in g["exercises"]}
+        # Höchster je erreichter Wochenwert (uncapped) – wird ab S+ angezeigt.
+        best_weeklies = {ex["key"]: 0.0 for ex in g["exercises"]}
+        # Wochenziele pro Übung × Woche (aus der berechneten Progression).
+        goal_by_week_by_ex = {}
+        for ex in g["exercises"]:
+            st_ex = state.get(ex["key"], {})
+            prog = st_ex.get("progression", []) or []
+            goal_by_week_by_ex[ex["key"]] = {
+                int(p.get("week") or 0): float(p.get("goal") or 0) for p in prog
+            }
         all_entries = await db.progress_entries.find(
             {"user_id": u["user_id"]}, {"_id": 0}
         ).to_list(1000)
@@ -1156,9 +1175,18 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
                     "ex2": float(pe.get("pushups", 0) or 0),
                     "ex3": float(pe.get("pullups", 0) or 0),
                 }
+            wn = int(pe.get("week_number") or 0)
             for k, v in week_vals.items():
                 if k in all_time_totals:
                     all_time_totals[k] += v
+                if k in best_weeklies and v > best_weeklies[k]:
+                    best_weeklies[k] = v
+                if k in best_goals:
+                    wk_goal = float(goal_by_week_by_ex.get(k, {}).get(wn, 0) or 0)
+                    if wk_goal > 0:
+                        earned = v if v < wk_goal else wk_goal
+                        if earned > best_goals[k]:
+                            best_goals[k] = earned
         streak = _streak_info(state, g["exercises"], progress_by_week, cur_week)
         last_streak = int(g.get("last_streak", 0))
         cur_streak = int(streak["current"])
@@ -1209,6 +1237,14 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
             "updated_at": entry.get("updated_at") if entry else None,
             "streak": streak,
             "all_time": {k: round(v, 2) for k, v in all_time_totals.items()},
+            # 🏆 Höchster je in EINER Woche „erspielter" Wert pro Übung
+            # (= min(weekValue, weekGoal)). Verlässliche Quelle für die
+            # Rang-Anzeige auf der Kartenrückseite. Einmal erreichte Ränge
+            # bleiben so auch in folgenden Wochen erhalten, in denen das
+            # Ziel noch nicht erfüllt wurde – und sind auf jedem Gerät und
+            # für jeden Betrachter sichtbar.
+            "best_goals": {k: round(v, 2) for k, v in best_goals.items()},
+            "best_weeklies": {k: round(v, 2) for k, v in best_weeklies.items()},
             "is_online": u["user_id"] in manager.online_user_ids(),
             # Nur für eigenen Eintrag relevant. Wird vom Frontend genutzt, um die
             # "Week N failed"-Animation einmalig beim Öffnen der neuen Woche zu zeigen.
