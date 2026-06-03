@@ -89,6 +89,9 @@ class AuthPreferencesUpdate(BaseModel):
 class LiveSaveUpdate(BaseModel):
     live_save_enabled: bool
 
+class HideBoostButtonsUpdate(BaseModel):
+    hide_boost_buttons: bool
+
 class CustomStepsUpdate(BaseModel):
     custom_steps: dict
 
@@ -502,6 +505,23 @@ async def set_live_save(payload: LiveSaveUpdate, user: User = Depends(get_curren
     )
     return {"live_save_enabled": bool(payload.live_save_enabled)}
 
+# -------------------- Hide-Boost-Buttons Preference --------------------
+# Wenn aktiviert, blendet das Frontend auf den UserCards den "Boost"-Aktivieren-
+# Button aus. Bereits geboostete Uebungen (Umrandung / "BOOST"-Pille / Cancel)
+# bleiben weiterhin sichtbar.
+@api_router.get("/me/hide-boost-buttons")
+async def get_hide_boost_buttons(user: User = Depends(get_current_user)):
+    user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    return {"hide_boost_buttons": bool(user_doc.get("hide_boost_buttons", False)) if user_doc else False}
+
+@api_router.put("/me/hide-boost-buttons")
+async def set_hide_boost_buttons(payload: HideBoostButtonsUpdate, user: User = Depends(get_current_user)):
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$set": {"hide_boost_buttons": bool(payload.hide_boost_buttons)}}
+    )
+    return {"hide_boost_buttons": bool(payload.hide_boost_buttons)}
+
 # -------------------- Custom Steps (Schrittweiten) --------------------
 # Pro User wird ein Dictionary { exerciseKey: stepValue } persistiert,
 # damit die im Dashboard ("Fortschritt eintragen") eingestellten
@@ -609,6 +629,23 @@ def _ensure_progression_pct(exercises: list) -> list:
 def _boosted_weeks_for(g: dict, exercise_key: str) -> set:
     return {b["week_number"] for b in g.get("boosts", []) if b.get("exercise_key") == exercise_key}
 
+def _boost_versions_for(g: dict, exercise_key: str) -> dict:
+    """Mapping week_number -> formula_version.
+    Version 1 (Altdaten): Boost addiert +25% multiplikativ ZUSÄTZLICH zur Wochen-Steigerung.
+    Version 2 (Neuverhalten): Boost ERSETZT die Wochen-Steigerung -> insgesamt +25% in der Boost-Woche.
+    Boosts ohne gespeicherte Version werden als Version 1 (alt) behandelt, damit
+    historische Werte der User unveraendert bleiben."""
+    out = {}
+    for b in g.get("boosts", []):
+        if b.get("exercise_key") != exercise_key:
+            continue
+        try:
+            v = int(b.get("formula_version") or 1)
+        except (TypeError, ValueError):
+            v = 1
+        out[b["week_number"]] = 2 if v >= 2 else 1
+    return out
+
 async def _progress_by_week(user_id: str, exercises: list) -> dict:
     entries = await db.progress_entries.find({"user_id": user_id}, {"_id": 0}).to_list(1000)
     out = {}
@@ -629,7 +666,8 @@ async def _progress_by_week(user_id: str, exercises: list) -> dict:
     return out
 
 def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week: dict,
-                        current_week: int, future_weeks: int = FUTURE_WEEKS) -> dict:
+                        current_week: int, future_weeks: int = FUTURE_WEEKS,
+                        boost_versions: Optional[dict] = None) -> dict:
     base = float(exercise.get("base_value", 0) or 0)
     unit = exercise.get("unit", "")
     ex_key = exercise["key"]
@@ -651,8 +689,14 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
     if added_week < 1:
         added_week = 1
 
+    if boost_versions is None:
+        boost_versions = {}
+
     eff_idx = 0
-    active_boosts = []
+    # active_boosts speichert Tupel (week, version). version=1 = altes Verhalten
+    # (Boost addiert +25% zusaetzlich zur Wochen-Steigerung). version=2 = neues
+    # Verhalten (Boost ersetzt die Wochen-Steigerung dieser Woche -> insgesamt 25%).
+    active_boosts: list = []
     missed = []
     progression = []
 
@@ -674,9 +718,16 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
 
         boost_this_week = w in all_boost_weeks
         if boost_this_week:
-            active_boosts.append(w)
+            active_boosts.append((w, boost_versions.get(w, 1)))
 
-        goal_raw = base * ((1 + ex_increase) ** eff_idx) * ((1 + BOOST_INCREASE) ** len(active_boosts))
+        # v2-Boosts ersetzen in ihrer Woche die normale Wochen-Steigerung.
+        # Cumulative Multiplier:
+        #   (1+ex_inc)^(eff_idx - v2_count) * (1+BOOST_INCREASE)^(v1_count + v2_count)
+        # Bei reinen v1-Boosts (Altdaten) reduziert sich das auf die alte Formel.
+        v2_count = sum(1 for _, ver in active_boosts if ver == 2)
+        total_boosts = len(active_boosts)
+        prog_exp = max(0, eff_idx - v2_count)
+        goal_raw = base * ((1 + ex_increase) ** prog_exp) * ((1 + BOOST_INCREASE) ** total_boosts)
         goal_rounded = _round_goal(goal_raw, unit)
 
         if w < current_week:
@@ -688,7 +739,7 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
             tol = max(0.01, goal_rounded * 0.005)
             if logged + tol < goal_rounded:
                 missed.append(w)
-                active_boosts = [b for b in active_boosts if b > w]
+                active_boosts = [b for b in active_boosts if b[0] > w]
                 status = "missed"
                 voided_boost = boost_this_week
             else:
@@ -719,7 +770,7 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
 
     return {
         "missed_weeks": missed,
-        "effective_boost_weeks": sorted(active_boosts),
+        "effective_boost_weeks": sorted(b[0] for b in active_boosts),
         "current_goal": current_goal,
         "progression": progression,
         "added_week": added_week,
@@ -731,7 +782,8 @@ async def _compute_user_state(user_id: str, g: dict, current_week: int) -> dict:
     state = {}
     for ex in exercises:
         bws = _boosted_weeks_for(g, ex["key"])
-        state[ex["key"]] = _compute_progression(ex, bws, progress_by_week, current_week)
+        bvs = _boost_versions_for(g, ex["key"])
+        state[ex["key"]] = _compute_progression(ex, bws, progress_by_week, current_week, boost_versions=bvs)
     return state
 
 @api_router.get("/goals/me")
@@ -824,9 +876,14 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
         else:
             ex["progression_last_changed_week"] = last_changed
 
+    # Boosts gehoerend zu nun geloeschten Uebungen mitloeschen, damit der
+    # "diese Woche bereits geboostet"-Block nicht haengen bleibt und der User
+    # wieder eine andere Uebung boosten kann.
+    pruned_boosts = [b for b in g.get("boosts", []) if b.get("exercise_key") in new_keys]
+
     await db.user_goals.update_one(
         {"user_id": user.user_id},
-        {"$set": {"exercises": exercises}}
+        {"$set": {"exercises": exercises, "boosts": pruned_boosts}}
     )
     await manager.broadcast({"type": "goals_updated", "user_id": user.user_id})
     g = await db.user_goals.find_one({"user_id": user.user_id}, {"_id": 0})
@@ -1317,6 +1374,10 @@ async def boost_exercise(payload: BoostRequest, user: User = Depends(get_current
         "exercise_key": payload.exercise_key,
         "week_number": cur_week,
         "applied_at": datetime.now(timezone.utc).isoformat(),
+        # Version 2: Boost ERSETZT die Wochen-Steigerung (insgesamt +25% in der
+        # Boost-Woche statt zusaetzlich +25%). Alte Boosts ohne dieses Feld
+        # behalten ihr urspruengliches Verhalten (siehe _boost_versions_for).
+        "formula_version": 2,
     }
     await db.user_goals.update_one(
         {"user_id": user.user_id},
