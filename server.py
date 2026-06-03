@@ -1366,9 +1366,24 @@ async def boost_exercise(payload: BoostRequest, user: User = Depends(get_current
     if isinstance(sd, str):
         sd = datetime.fromisoformat(sd)
     cur_week = _calc_week_number(sd)
-    if not any(e["key"] == payload.exercise_key for e in g["exercises"]):
+    existing_keys = {e["key"] for e in g["exercises"]}
+    if payload.exercise_key not in existing_keys:
         raise HTTPException(status_code=400, detail="Unknown exercise")
-    if any(b["week_number"] == cur_week for b in g.get("boosts", [])):
+
+    # Verwaiste Boosts (Uebung wurde inzwischen geloescht) zaehlen NICHT mehr
+    # als "diese Woche bereits geboostet". Gleichzeitig raeumen wir solche
+    # Eintraege beim naechsten Boost-Versuch direkt aus der DB auf, damit sie
+    # auch nicht ins Boost-Ranking spielen.
+    all_boosts = g.get("boosts", [])
+    stale_boosts = [b for b in all_boosts if b.get("exercise_key") not in existing_keys]
+    valid_boosts = [b for b in all_boosts if b.get("exercise_key") in existing_keys]
+    if stale_boosts:
+        await db.user_goals.update_one(
+            {"user_id": user.user_id},
+            {"$pull": {"boosts": {"exercise_key": {"$nin": list(existing_keys)}}}},
+        )
+
+    if any(b["week_number"] == cur_week for b in valid_boosts):
         raise HTTPException(status_code=400, detail="Du hast diese Woche bereits geboostet")
     new_boost = {
         "exercise_key": payload.exercise_key,
@@ -1399,13 +1414,20 @@ async def cancel_boost(user: User = Depends(get_current_user)):
     if isinstance(sd, str):
         sd = datetime.fromisoformat(sd)
     cur_week = _calc_week_number(sd)
+    existing_keys = {e["key"] for e in g["exercises"]}
     boosts = g.get("boosts", [])
-    target = next((b for b in boosts if b["week_number"] == cur_week), None)
+    # Nur Boosts beachten, deren Uebung noch existiert. Verwaiste Eintraege
+    # werden ohnehin nicht ausgewertet und beim naechsten /boost aufgeraeumt.
+    target = next(
+        (b for b in boosts
+         if b["week_number"] == cur_week and b.get("exercise_key") in existing_keys),
+        None,
+    )
     if not target:
         raise HTTPException(status_code=404, detail="Kein aktiver Boost diese Woche")
     await db.user_goals.update_one(
         {"user_id": user.user_id},
-        {"$pull": {"boosts": {"week_number": cur_week}}},
+        {"$pull": {"boosts": {"week_number": cur_week, "exercise_key": target["exercise_key"]}}},
     )
     await manager.broadcast({
         "type": "boost_canceled",
