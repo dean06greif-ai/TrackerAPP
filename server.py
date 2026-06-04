@@ -814,7 +814,7 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
     if isinstance(sd, str):
         sd = datetime.fromisoformat(sd)
     cur_week = _calc_week_number(sd)
-    PROGRESSION_COOLDOWN = 4
+    PROGRESSION_COOLDOWN = 1
     old_by_key = {e["key"]: e for e in g.get("exercises", [])}
     # Schutz: Standard-Übungen (is_default=True) dürfen ab Woche 2 nicht mehr gelöscht werden
     new_keys = {e["key"] for e in exercises}
