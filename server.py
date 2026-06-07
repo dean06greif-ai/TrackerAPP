@@ -646,6 +646,43 @@ def _boost_versions_for(g: dict, exercise_key: str) -> dict:
         out[b["week_number"]] = 2 if v >= 2 else 1
     return out
 
+def _get_pct_for_week(exercise: dict, week: int) -> int:
+    """Liefert die für die angegebene Woche geltende Steigerung (in Prozent, 0..10).
+
+    Eine pro Übung gepflegte History `progression_overrides: List[{from_week, pct}]`
+    bestimmt, welche Steigerung ab welcher Woche gilt. Es wird der jüngste Eintrag
+    mit ``from_week <= week`` verwendet. Existieren keine Overrides (Legacy-Daten),
+    wird ``progression_pct`` als Fallback für alle Wochen verwendet.
+    """
+    try:
+        default_pct = int(round(float(exercise.get("progression_pct", 10))))
+    except (TypeError, ValueError):
+        default_pct = 10
+    default_pct = max(0, min(10, default_pct))
+
+    overrides = exercise.get("progression_overrides") or []
+    if not isinstance(overrides, list) or not overrides:
+        return default_pct
+
+    chosen = None
+    chosen_from = -1
+    for o in overrides:
+        if not isinstance(o, dict):
+            continue
+        try:
+            fw = int(o.get("from_week"))
+        except (TypeError, ValueError):
+            continue
+        if fw <= week and fw > chosen_from:
+            try:
+                pct = int(round(float(o.get("pct", default_pct))))
+            except (TypeError, ValueError):
+                pct = default_pct
+            chosen = max(0, min(10, pct))
+            chosen_from = fw
+    return chosen if chosen is not None else default_pct
+
+
 async def _progress_by_week(user_id: str, exercises: list) -> dict:
     entries = await db.progress_entries.find({"user_id": user_id}, {"_id": 0}).to_list(1000)
     out = {}
@@ -672,13 +709,6 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
     unit = exercise.get("unit", "")
     ex_key = exercise["key"]
 
-    try:
-        pct = int(round(float(exercise.get("progression_pct", 10))))
-    except (TypeError, ValueError):
-        pct = 10
-    pct = max(0, min(10, pct))
-    ex_increase = pct / 100.0
-
     # Übung existiert erst ab dieser Woche. Frühere Wochen werden weder als
     # "missed" markiert noch zählen sie in die Streak — sie hatten ja gar keine
     # Vorgabe, weil die Übung damals noch gar nicht im Plan war.
@@ -700,6 +730,14 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
     missed = []
     progression = []
 
+    # Liste der (1+pct/100)-Faktoren, die kumuliert in das aktuelle Ziel eingehen.
+    # Wird wochenweise befüllt — abhängig von der für jede Woche tatsächlich
+    # geltenden Steigerung (siehe `_get_pct_for_week`). v2-Boost-Wochen tragen
+    # KEINE reguläre Wochensteigerung bei (der +25%-Boost ersetzt sie). Bei einer
+    # verfehlten Woche wird der zuvor angefügte Faktor wieder entfernt, damit
+    # die Folgewochen das gleiche Ziel wie die verfehlte Woche behalten.
+    eff_factors: list = []
+
     last_week = max(current_week, 1) + future_weeks
 
     for w in range(1, last_week + 1):
@@ -719,29 +757,42 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
         boost_this_week = w in all_boost_weeks
         if boost_this_week:
             active_boosts.append((w, boost_versions.get(w, 1)))
+        is_v2_boost = boost_this_week and boost_versions.get(w, 1) == 2
 
-        # v2-Boosts ersetzen in ihrer Woche die normale Wochen-Steigerung.
-        # Cumulative Multiplier:
-        #   (1+ex_inc)^(eff_idx - v2_count) * (1+BOOST_INCREASE)^(v1_count + v2_count)
-        # Bei reinen v1-Boosts (Altdaten) reduziert sich das auf die alte Formel.
-        v2_count = sum(1 for _, ver in active_boosts if ver == 2)
+        # Pct für diese Woche (Steigerung von w-1 -> w). In `added_week` selbst
+        # gilt der Startwert (kein Faktor). Ab der Folgewoche wird der pro Woche
+        # individuell hinterlegte Wert verwendet.
+        pct_w = _get_pct_for_week(exercise, w) / 100.0
+
+        # Faktor dieser Woche hinzufügen — außer in `added_week` (Startwert)
+        # und außer in v2-Boost-Wochen (Boost ersetzt die Wochen-Steigerung).
+        added_factor_this_week = False
+        if w > added_week and not is_v2_boost:
+            eff_factors.append(1.0 + pct_w)
+            added_factor_this_week = True
+
+        prog_mult = 1.0
+        for f in eff_factors:
+            prog_mult *= f
+
         total_boosts = len(active_boosts)
-        prog_exp = max(0, eff_idx - v2_count)
-        goal_raw = base * ((1 + ex_increase) ** prog_exp) * ((1 + BOOST_INCREASE) ** total_boosts)
+        goal_raw = base * prog_mult * ((1 + BOOST_INCREASE) ** total_boosts)
         goal_rounded = _round_goal(goal_raw, unit)
 
         if w < current_week:
             logged = float(progress_by_week.get(w, {}).get(ex_key, 0) or 0)
             # Float-Toleranz: 0.5% vom Ziel, mindestens 0.01.
-            # Verhindert, dass akkumulierte Float-Rundungsfehler aus dem
-            # Tages-Modus (Mo-So) eine erfuellte Woche faelschlich als
-            # "missed" markieren und damit den Streak zerstoeren.
             tol = max(0.01, goal_rounded * 0.005)
             if logged + tol < goal_rounded:
                 missed.append(w)
                 active_boosts = [b for b in active_boosts if b[0] > w]
                 status = "missed"
                 voided_boost = boost_this_week
+                # Verfehlte Woche: angesammelten Faktor wieder herausnehmen,
+                # damit Folgewochen das identische Ziel beibehalten ("bleibt
+                # beim alten Wert, der nicht geschafft wurde").
+                if added_factor_this_week and eff_factors:
+                    eff_factors.pop()
             else:
                 status = "completed"
                 voided_boost = False
@@ -749,9 +800,11 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
         elif w == current_week:
             status = "current"
             voided_boost = False
+            eff_idx += 1
         else:
             status = "future"
             voided_boost = False
+            eff_idx += 1
 
         progression.append({
             "week": w,
@@ -760,11 +813,6 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
             "boost": boost_this_week,
             "voided_boost": voided_boost,
         })
-
-        if status == "future":
-            eff_idx += 1
-        elif status == "current":
-            eff_idx += 1
 
     current_goal = next((p["goal"] for p in progression if p["week"] == current_week), 0)
 
@@ -837,6 +885,13 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
             ex["added_week"] = cur_week
             ex["progression_last_changed_week"] = cur_week
             ex["is_default"] = False  # benutzerdefinierte Übungen sind nie "default"
+            # Initialer Override: ab Hinzufüge-Woche gilt die gewählte Steigerung.
+            try:
+                init_pct = int(round(float(ex.get("progression_pct", 10))))
+            except (TypeError, ValueError):
+                init_pct = 10
+            init_pct = max(0, min(10, init_pct))
+            ex["progression_overrides"] = [{"from_week": cur_week, "pct": init_pct}]
             continue
         # Bestehende Übung: added_week unverändert übernehmen
         if old.get("added_week") is not None:
@@ -865,6 +920,12 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
         old_pct = int(old.get("progression_pct", 10))
         new_pct = int(ex.get("progression_pct", 10))
         last_changed = int(old.get("progression_last_changed_week", added_week))
+        # Bestehende Override-History aus altem Dokument übernehmen.
+        old_overrides = list(old.get("progression_overrides") or [])
+        if not old_overrides:
+            # Legacy-Migration: alle bisherigen Wochen hatten implizit old_pct.
+            old_overrides = [{"from_week": int(added_week), "pct": int(old_pct)}]
+        ex["progression_overrides"] = old_overrides
         if new_pct != old_pct:
             if not is_new_in_first_week and cur_week > 1 and (cur_week - last_changed) < PROGRESSION_COOLDOWN:
                 weeks_left = PROGRESSION_COOLDOWN - (cur_week - last_changed)
@@ -873,6 +934,17 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
                     detail=f"Steigerung für '{ex['name']}' kann erst in {weeks_left} Woche(n) wieder angepasst werden",
                 )
             ex["progression_last_changed_week"] = cur_week
+            # Override anlegen/aktualisieren: ab der AKTUELLEN Woche gilt der neue
+            # Prozentsatz. Frühere Wochen behalten ihren historischen Wert.
+            updated_ovs = [
+                o for o in old_overrides
+                if isinstance(o, dict)
+                and o.get("from_week") is not None
+                and int(o.get("from_week")) != cur_week
+            ]
+            updated_ovs.append({"from_week": int(cur_week), "pct": int(new_pct)})
+            updated_ovs.sort(key=lambda o: int(o.get("from_week") or 0))
+            ex["progression_overrides"] = updated_ovs
         else:
             ex["progression_last_changed_week"] = last_changed
 
@@ -897,6 +969,13 @@ async def reset_start_date(user: User = Depends(get_current_user)):
     for ex in exercises:
         ex["progression_last_changed_week"] = 1
         ex["added_week"] = 1
+        # Override-History zurücksetzen: Programm-Neustart -> aktueller pct gilt ab Woche 1
+        try:
+            init_pct = int(round(float(ex.get("progression_pct", 10))))
+        except (TypeError, ValueError):
+            init_pct = 10
+        init_pct = max(0, min(10, init_pct))
+        ex["progression_overrides"] = [{"from_week": 1, "pct": init_pct}]
     await db.user_goals.update_one(
         {"user_id": user.user_id},
         {"$set": {"start_date": now, "exercises": exercises, "last_streak": 0}},
