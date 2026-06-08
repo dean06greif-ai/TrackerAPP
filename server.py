@@ -785,7 +785,12 @@ def _compute_progression(exercise: dict, all_boost_weeks: set, progress_by_week:
             tol = max(0.01, goal_rounded * 0.005)
             if logged + tol < goal_rounded:
                 missed.append(w)
-                active_boosts = [b for b in active_boosts if b[0] > w]
+                # Bugfix: Nur den Boost DIESER (verfehlten) Woche annullieren.
+                # Frueher wurden alle bisherigen Boosts entfernt (b[0] > w filtert
+                # alles <= w heraus), wodurch Boosts aus frueheren Wochen
+                # nachtraeglich verloren gingen. Jetzt: nur b[0] == w wird
+                # entfernt — vorherige Boosts bleiben erhalten.
+                active_boosts = [b for b in active_boosts if b[0] != w]
                 status = "missed"
                 voided_boost = boost_this_week
                 # Verfehlte Woche: angesammelten Faktor wieder herausnehmen,
