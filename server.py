@@ -557,6 +557,103 @@ async def set_custom_steps(payload: CustomStepsUpdate, user: User = Depends(get_
     )
     return {"custom_steps": cleaned}
 
+# -------------------- Tier-System ----------------------------------------
+# Pro User × Übung wird der aktuell aktive Tier (I/II/III), die Liste der
+# freigeschalteten Tiers sowie pro Tier { week_number, weekly_value,
+# best_goal, best_weekly } persistiert. Damit bleibt der Tier-Status auch
+# nach Browser-/Geräte-Wechsel erhalten und ist später erweiterbar (z. B.
+# fremde Karten lesen die Tier-Anzeige aus der DB).
+#
+# Schema in MongoDB (Collection `users`, Feld `tier_state`):
+#   tier_state: {
+#     [exerciseKey]: {
+#       current_tier: 1|2|3,
+#       unlocked: [1, ...],
+#       tiers: {
+#         "1": { week_number: int, weekly_value: float, best_goal: float, best_weekly: float },
+#         "2": { ... },
+#         "3": { ... }
+#       }
+#     }, ...
+#   }
+def _sanitize_tier_state(raw: dict) -> dict:
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for ex_key, ex_val in raw.items():
+        if not isinstance(ex_key, str) or not ex_key:
+            continue
+        if not isinstance(ex_val, dict):
+            continue
+        try:
+            ct = int(ex_val.get("current_tier", 1))
+        except (TypeError, ValueError):
+            ct = 1
+        if ct not in (1, 2, 3):
+            ct = 1
+        unlocked_raw = ex_val.get("unlocked") or [1]
+        unlocked = []
+        if isinstance(unlocked_raw, list):
+            for u in unlocked_raw:
+                try:
+                    ui = int(u)
+                    if ui in (1, 2, 3) and ui not in unlocked:
+                        unlocked.append(ui)
+                except (TypeError, ValueError):
+                    continue
+        if 1 not in unlocked:
+            unlocked.insert(0, 1)
+        unlocked = sorted(unlocked)
+        tiers_raw = ex_val.get("tiers") or {}
+        tiers_clean = {}
+        for t in (1, 2, 3):
+            key_variants = [t, str(t)]
+            t_entry = None
+            if isinstance(tiers_raw, dict):
+                for kv in key_variants:
+                    if kv in tiers_raw and isinstance(tiers_raw[kv], dict):
+                        t_entry = tiers_raw[kv]
+                        break
+            if not t_entry:
+                t_entry = {}
+            def _num(v, default=0.0):
+                try:
+                    n = float(v)
+                    if n < 0 or n > 1e9:
+                        return default
+                    return n
+                except (TypeError, ValueError):
+                    return default
+            tiers_clean[str(t)] = {
+                "week_number": int(_num(t_entry.get("week_number"), 0)),
+                "weekly_value": _num(t_entry.get("weekly_value"), 0.0),
+                "best_goal": _num(t_entry.get("best_goal"), 0.0),
+                "best_weekly": _num(t_entry.get("best_weekly"), 0.0),
+            }
+        out[ex_key] = {
+            "current_tier": ct,
+            "unlocked": unlocked,
+            "tiers": tiers_clean,
+        }
+    return out
+
+@api_router.get("/tiers/me")
+async def get_tier_state_me(user: User = Depends(get_current_user)):
+    user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    state = (user_doc or {}).get("tier_state") or {}
+    return {"tier_state": _sanitize_tier_state(state)}
+
+@api_router.put("/tiers/me")
+async def set_tier_state_me(payload: dict, user: User = Depends(get_current_user)):
+    raw = payload.get("tier_state") if isinstance(payload, dict) else None
+    cleaned = _sanitize_tier_state(raw or {})
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$set": {"tier_state": cleaned}}
+    )
+    return {"tier_state": cleaned}
+
+
 # -------------------- Goals --------------------
 def _calc_week_number(start_date: datetime) -> int:
     if start_date.tzinfo is None:
@@ -1386,6 +1483,11 @@ async def board(week: Optional[int] = None, user: User = Depends(get_current_use
             # für jeden Betrachter sichtbar.
             "best_goals": {k: round(v, 2) for k, v in best_goals.items()},
             "best_weeklies": {k: round(v, 2) for k, v in best_weeklies.items()},
+            # 🏋️ Tier-State pro Übung (current_tier, unlocked, tiers).
+            # Wird vom Frontend genutzt, um auf fremden Karten den aktuellen
+            # Tier (I/II/III) plus Rang anzuzeigen. Bereinigt über
+            # _sanitize_tier_state, damit nur sauberes Schema raus geht.
+            "tier_state": _sanitize_tier_state((u or {}).get("tier_state") or {}),
             "is_online": u["user_id"] in manager.online_user_ids(),
             # Nur für eigenen Eintrag relevant. Wird vom Frontend genutzt, um die
             # "Week N failed"-Animation einmalig beim Öffnen der neuen Woche zu zeigen.
