@@ -642,6 +642,9 @@ def _sanitize_tier_state(raw: dict) -> dict:
                 "best_goal": _num(t_entry.get("best_goal"), 0.0),
                 "best_weekly": _num(t_entry.get("best_weekly"), 0.0),
                 "label": clean_label,
+                "base_value": _num(t_entry.get("base_value"), 0.0),
+                "unit": (t_entry.get("unit") if isinstance(t_entry.get("unit"), str) else "")[:20],
+                "progression_pct": max(0, min(10, int(round(_num(t_entry.get("progression_pct"), 10))))),
             }
         out[ex_key] = {
             "current_tier": ct,
@@ -1019,19 +1022,10 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
         elif int(ex.get("added_week") or 1) == 1 and ex["key"] in ("ex1", "ex2", "ex3"):
             # Legacy-Migration: alte Daten ohne is_default - die ursprünglichen 3 Default-Übungen markieren
             ex["is_default"] = True
-        # In der Hinzufüge-Woche dürfen Startwert/Einheit/Steigerung frei geändert werden.
+        # Startwert / Einheit / Steigerung sind ab sofort DAUERHAFT frei
+        # änderbar (Sperren komplett entfernt). Tiers laufen unabhängig
+        # voneinander, daher darf sich auch die Steigerung jederzeit ändern.
         added_week = int(ex.get("added_week") or 1)
-        weeks_since_added = cur_week - added_week + 1
-        is_new_in_first_week = weeks_since_added <= 1
-        if cur_week > 1 and not is_new_in_first_week:
-            try:
-                if float(ex.get("base_value", 0)) != float(old.get("base_value", 0)):
-                    ex["base_value"] = float(old.get("base_value", 0))
-            except (TypeError, ValueError):
-                ex["base_value"] = float(old.get("base_value", 0))
-            # Einheit ebenfalls ab Woche 2 (nach Hinzufügen) gesperrt
-            if (ex.get("unit") or "") != (old.get("unit") or ""):
-                ex["unit"] = old.get("unit") or ""
         old_pct = int(old.get("progression_pct", 10))
         new_pct = int(ex.get("progression_pct", 10))
         last_changed = int(old.get("progression_last_changed_week", added_week))
@@ -1042,12 +1036,6 @@ async def update_my_goals(payload: GoalsUpdate, user: User = Depends(get_current
             old_overrides = [{"from_week": int(added_week), "pct": int(old_pct)}]
         ex["progression_overrides"] = old_overrides
         if new_pct != old_pct:
-            if not is_new_in_first_week and cur_week > 1 and (cur_week - last_changed) < PROGRESSION_COOLDOWN:
-                weeks_left = PROGRESSION_COOLDOWN - (cur_week - last_changed)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Steigerung für '{ex['name']}' kann erst in {weeks_left} Woche(n) wieder angepasst werden",
-                )
             ex["progression_last_changed_week"] = cur_week
             # Override anlegen/aktualisieren: ab der AKTUELLEN Woche gilt der neue
             # Prozentsatz. Frühere Wochen behalten ihren historischen Wert.
