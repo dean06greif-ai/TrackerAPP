@@ -580,33 +580,36 @@ def _sanitize_tier_state(raw: dict) -> dict:
     out = {}
     if not isinstance(raw, dict):
         return out
+    valid_tiers = (1, 2, 3, 4, 5)
     for ex_key, ex_val in raw.items():
         if not isinstance(ex_key, str) or not ex_key:
             continue
         if not isinstance(ex_val, dict):
             continue
-        try:
-            ct = int(ex_val.get("current_tier", 1))
-        except (TypeError, ValueError):
-            ct = 1
-        if ct not in (1, 2, 3):
-            ct = 1
-        unlocked_raw = ex_val.get("unlocked") or [1]
+        # Liste der vom User manuell hinzugefügten Tiers (bis zu 5).
+        # Standard: leer -> die Übung hat gar keine Tiers. Kein automatisches
+        # Erzwingen von Tier 1 mehr (Tiers werden nur per "+" hinzugefügt).
+        unlocked_raw = ex_val.get("unlocked") or []
         unlocked = []
         if isinstance(unlocked_raw, list):
             for u in unlocked_raw:
                 try:
                     ui = int(u)
-                    if ui in (1, 2, 3) and ui not in unlocked:
+                    if ui in valid_tiers and ui not in unlocked:
                         unlocked.append(ui)
                 except (TypeError, ValueError):
                     continue
-        if 1 not in unlocked:
-            unlocked.insert(0, 1)
         unlocked = sorted(unlocked)
+        # Aktiver Tier: 0 = keiner. Sonst muss er in unlocked liegen.
+        try:
+            ct = int(ex_val.get("current_tier", 0))
+        except (TypeError, ValueError):
+            ct = 0
+        if ct not in unlocked:
+            ct = unlocked[0] if unlocked else 0
         tiers_raw = ex_val.get("tiers") or {}
         tiers_clean = {}
-        for t in (1, 2, 3):
+        for t in valid_tiers:
             key_variants = [t, str(t)]
             t_entry = None
             if isinstance(tiers_raw, dict):
@@ -624,11 +627,21 @@ def _sanitize_tier_state(raw: dict) -> dict:
                     return n
                 except (TypeError, ValueError):
                     return default
+            # Optionaler benutzerdefinierter Label-Text pro Tier
+            # (z. B. "+30 kg extra" statt "+20 kg extra"). Max 40 Zeichen,
+            # damit die UI-Darstellung nicht sprengt. Leerer String = Default
+            # verwenden (wird vom Frontend anhand kind + weight bestimmt).
+            raw_label = t_entry.get("label")
+            if isinstance(raw_label, str):
+                clean_label = raw_label.strip()[:40]
+            else:
+                clean_label = ""
             tiers_clean[str(t)] = {
                 "week_number": int(_num(t_entry.get("week_number"), 0)),
                 "weekly_value": _num(t_entry.get("weekly_value"), 0.0),
                 "best_goal": _num(t_entry.get("best_goal"), 0.0),
                 "best_weekly": _num(t_entry.get("best_weekly"), 0.0),
+                "label": clean_label,
             }
         out[ex_key] = {
             "current_tier": ct,
